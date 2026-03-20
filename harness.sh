@@ -30,7 +30,7 @@ log ""
 # ═══════════════════════════════════════════════════════════════
 log "## Tier 0: Kernel Driver"
 
-if lsmod | grep -q amdgpu; then
+if lsmod 2>/dev/null | grep amdgpu >/dev/null 2>&1; then
     pass "amdgpu module loaded" 0
 else
     fail "amdgpu module NOT loaded"
@@ -39,13 +39,14 @@ else
     exit 1
 fi
 
-if ls /dev/dri/renderD* &>/dev/null; then
-    pass "render nodes exist: $(ls /dev/dri/renderD*)" 0
+RENDER_NODES=$(ls /dev/dri/renderD* 2>/dev/null || true)
+if [ -n "$RENDER_NODES" ]; then
+    pass "render nodes exist: ${RENDER_NODES}" 0
 else
     fail "no render nodes in /dev/dri/"
 fi
 
-DMESG_ERRORS=$(dmesg | grep -i amdgpu | grep -ci "error\|fault\|fail" || true)
+DMESG_ERRORS=$(dmesg 2>/dev/null | grep -i amdgpu | grep -ci "error\|fault\|fail" || true)
 if [ "$DMESG_ERRORS" -lt 3 ]; then
     pass "dmesg amdgpu errors: ${DMESG_ERRORS} (acceptable)" 0
 else
@@ -61,7 +62,7 @@ log "## Tier 1: Userspace Detection"
 
 # Try rocm-smi first
 if command -v rocm-smi &>/dev/null; then
-    if rocm-smi --showid 2>/dev/null | grep -qi "gpu\|device"; then
+    if rocm-smi --showid 2>/dev/null | grep -i "gpu\|device" >/dev/null 2>&1; then
         pass "rocm-smi detects GPU" 1
     else
         fail "rocm-smi exists but doesn't detect GPU"
@@ -72,8 +73,9 @@ fi
 
 # Try rocminfo
 if command -v rocminfo &>/dev/null; then
-    if rocminfo 2>/dev/null | grep -qi "gfx10"; then
-        GFX_ID=$(rocminfo 2>/dev/null | grep -oP "gfx\d+" | head -1)
+    ROCMINFO_OUT=$(rocminfo 2>/dev/null || true)
+    if echo "$ROCMINFO_OUT" | grep -i "gfx10" >/dev/null 2>&1; then
+        GFX_ID=$(echo "$ROCMINFO_OUT" | grep -oP "gfx\d+" | head -1)
         pass "rocminfo detects GPU: ${GFX_ID}" 1
     else
         fail "rocminfo exists but doesn't detect gfx10 GPU"
@@ -84,7 +86,7 @@ fi
 
 # Vulkan detection (should always work via RADV)
 if command -v vulkaninfo &>/dev/null; then
-    if vulkaninfo --summary 2>/dev/null | grep -qi "radeon\|navi\|5700"; then
+    if vulkaninfo --summary 2>/dev/null | grep -i "radeon\|navi\|5700" >/dev/null 2>&1; then
         pass "Vulkan detects GPU via RADV" 1
     else
         fail "vulkaninfo doesn't detect AMD GPU"
@@ -113,7 +115,7 @@ int main() {
     if (err == hipSuccess && count > 0) {
         hipDeviceProp_t prop;
         hipGetDeviceProperties(&prop, 0);
-        printf("HIP OK: %s (gfx%d)\n", prop.name, prop.gcnArch);
+        printf("HIP OK: %s (%s)\n", prop.name, prop.gcnArchName);
         return 0;
     }
     printf("HIP FAIL: err=%d count=%d\n", err, count);
