@@ -767,13 +767,15 @@ extern "C" __global__ void attention_f32(
     }
 
     // Reduce max across threads
-    sdata[nthreads + tid] = local_max;
+    // Workspace starts at sdata[seq_len] to avoid overlapping scores[0..seq_len-1]
+    float* workspace = sdata + seq_len;
+    workspace[tid] = local_max;
     __syncthreads();
     for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[nthreads + tid] = fmaxf(sdata[nthreads + tid], sdata[nthreads + tid + s]);
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
         __syncthreads();
     }
-    float max_val = sdata[nthreads];
+    float max_val = workspace[0];
     __syncthreads();
 
     // Exp and sum
@@ -784,13 +786,13 @@ extern "C" __global__ void attention_f32(
         local_sum += e;
     }
 
-    sdata[nthreads + tid] = local_sum;
+    workspace[tid] = local_sum;
     __syncthreads();
     for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[nthreads + tid] += sdata[nthreads + tid + s];
+        if (tid < s) workspace[tid] += workspace[tid + s];
         __syncthreads();
     }
-    float sum_val = sdata[nthreads];
+    float sum_val = workspace[0];
     __syncthreads();
 
     // Normalize

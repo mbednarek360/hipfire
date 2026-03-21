@@ -48,7 +48,18 @@ fn main() {
         let asst_tok = tokenizer.encode("assistant");
         let nl_tok = tokenizer.encode("\n");
 
+        let sys_tok = tokenizer.encode("system");
+        let sys_msg = tokenizer.encode("You are a helpful assistant.");
+
         let mut chat = Vec::new();
+        // system message
+        chat.extend_from_slice(&im_start);
+        chat.extend_from_slice(&sys_tok);
+        chat.extend_from_slice(&nl_tok);
+        chat.extend_from_slice(&sys_msg);
+        chat.extend_from_slice(&im_end);
+        chat.extend_from_slice(&nl_tok);
+        // user message
         chat.extend_from_slice(&im_start);
         chat.extend_from_slice(&user_tok);
         chat.extend_from_slice(&nl_tok);
@@ -91,10 +102,10 @@ fn main() {
         prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
 
     // Generate
-    let max_gen = 128;
+    let max_gen = 2048;
     eprintln!("\nGenerating (max {max_gen} tokens)...\n");
     let t2 = Instant::now();
-    let mut next_token = llama::argmax(&logits);
+    let mut next_token = llama::sample_top_p(&logits, 0.7, 0.8);
     let mut generated = Vec::new();
 
     for _ in 0..max_gen {
@@ -110,7 +121,7 @@ fn main() {
         let pos = prompt_tokens.len() + generated.len() - 1;
         logits = llama::forward(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache)
             .expect("forward pass failed");
-        next_token = llama::argmax(&logits);
+        next_token = llama::sample_top_p(&logits, 0.7, 0.8);
     }
 
     let gen_ms = t2.elapsed().as_millis();

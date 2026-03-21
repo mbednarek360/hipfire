@@ -914,3 +914,84 @@ pub fn argmax(logits: &[f32]) -> u32 {
         .map(|(i, _)| i as u32)
         .unwrap()
 }
+
+/// Sample the next token using temperature + top-p (nucleus) sampling.
+/// Qwen3 recommended: temperature=0.7, top_p=0.8
+pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+
+    // Apply temperature
+    let inv_temp = 1.0 / temperature;
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let probs: Vec<f32> = logits.iter()
+        .map(|&l| ((l - max_logit) * inv_temp).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    let probs: Vec<f32> = probs.iter().map(|p| p / sum).collect();
+
+    // Sort by probability descending (index, prob)
+    #[derive(PartialEq)]
+    struct Candidate(f32, u32);
+    impl Eq for Candidate {}
+    impl PartialOrd for Candidate {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            self.0.partial_cmp(&other.0)
+        }
+    }
+    impl Ord for Candidate {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        }
+    }
+
+    let mut heap = BinaryHeap::with_capacity(probs.len());
+    for (i, &p) in probs.iter().enumerate() {
+        heap.push(Candidate(p, i as u32));
+    }
+
+    // Accumulate until we exceed top_p
+    let mut cumulative = 0.0f32;
+    let mut candidates: Vec<(f32, u32)> = Vec::new();
+    while let Some(Candidate(p, idx)) = heap.pop() {
+        cumulative += p;
+        candidates.push((p, idx));
+        if cumulative >= top_p {
+            break;
+        }
+    }
+
+    // Renormalize and sample
+    let cand_sum: f32 = candidates.iter().map(|(p, _)| p).sum();
+    let r: f32 = simple_rand() * cand_sum;
+    let mut acc = 0.0f32;
+    for &(p, idx) in &candidates {
+        acc += p;
+        if acc >= r {
+            return idx;
+        }
+    }
+    candidates.last().map(|&(_, idx)| idx).unwrap_or(0)
+}
+
+/// Simple deterministic-seeded RNG (xorshift32). Not crypto-quality, fine for sampling.
+fn simple_rand() -> f32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static STATE: AtomicU32 = AtomicU32::new(0);
+
+    // Seed from time on first call
+    let mut s = STATE.load(Ordering::Relaxed);
+    if s == 0 {
+        s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        if s == 0 { s = 1; }
+    }
+    // xorshift32
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    STATE.store(s, Ordering::Relaxed);
+    (s as f32) / (u32::MAX as f32)
+}

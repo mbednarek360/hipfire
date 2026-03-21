@@ -1060,7 +1060,7 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
 
-        let block_size = 256u32.min(seq_len.max(head_dim) as u32);
+        let block_size = (seq_len.max(head_dim) as u32).next_power_of_two().min(256);
         let shared_mem = ((seq_len + block_size as usize) * 4) as u32;
 
         unsafe {
