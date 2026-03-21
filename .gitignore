@@ -3,3 +3,16 @@
 *.swo
 *~
 .DS_Store
+
+# Dev process files (Claude Code orchestration)
+CLAUDE.md
+NEXT-STEPS.md
+harness.sh
+results.tsv
+/findings/
+/experiments/
+
+# Model files
+*.gguf
+*.hfq
+*.safetensors
