@@ -180,6 +180,44 @@ impl Gpu {
         }
     }
 
+    /// Wave-cooperative Q4 GEMV (Q4_F16_G32 format, 0.625 B/w). Shuffle-based nibble distribution.
+    pub fn gemv_q4wave(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_q4wave", kernels::GEMV_Q4WAVE_SRC, "gemv_q4wave")?;
+        let func = &self.functions["gemv_q4wave"];
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, None, &mut params) }
+    }
+
+    /// Q4-as-Q8 GEMV: 4-bit precision stored in Q8_0 format (1.0625 B/w). Gets Q8 occupancy.
+    pub fn gemv_q4as8(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_q4as8", kernels::GEMV_Q4AS8_SRC, "gemv_q4as8")?;
+        let func = &self.functions["gemv_q4as8"];
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, None, &mut params) }
+    }
+
     /// Q8_0 embedding lookup: dequantize one row on GPU, output F32.
     pub fn embedding_lookup_q8(
         &mut self,

@@ -1066,3 +1066,120 @@ extern "C" __global__ void gemv_q4lut(
     if (tid == 0) y[row] = sum;
 }
 "#;
+
+/// Wave-cooperative Q4: use warp shuffle to distribute nibbles.
+/// Same Q4_F16_G32 format (20 bytes/32 elem = 0.625 B/w).
+/// 16 threads load 16 bytes, shuffle to give all 32 threads one nibble each.
+/// Avoids the tid<16 conditional branch in the inner loop.
+pub const GEMV_Q4WAVE_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q4wave(
+    const unsigned char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int blocks_per_row = K / 32;
+    const unsigned char* row_data = A + (size_t)row * blocks_per_row * 20;
+
+    float sum = 0.0f;
+
+    const int outer_iters = blocks_per_row / 8;
+    for (int oi = 0; oi < outer_iters; oi++) {
+        const unsigned char* base = row_data + oi * 8 * 20;
+        const float* xb = x + oi * 256;
+
+        #pragma unroll
+        for (int sub = 0; sub < 8; sub++) {
+            const unsigned char* block = base + sub * 20;
+            _Float16 scale = *(const _Float16*)(block);
+            _Float16 mn    = *(const _Float16*)(block + 2);
+
+            // Only threads 0-15 load a byte from memory
+            unsigned int byte_val = (tid < 16) ? (unsigned int)block[4 + tid] : 0u;
+            // Shuffle: thread t gets the byte that thread (t&15) loaded
+            unsigned int shared_byte = __shfl(byte_val, tid & 15);
+            // Extract: tid<16 gets low nibble, tid>=16 gets high nibble
+            unsigned int nibble = (tid < 16) ? (shared_byte & 0xF) : (shared_byte >> 4);
+
+            _Float16 w = (_Float16)((unsigned short)nibble) * scale + mn;
+            sum += (float)w * xb[sub * 32 + tid];
+        }
+    }
+
+    for (int bi = outer_iters * 8; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 20;
+        _Float16 scale = *(const _Float16*)(block);
+        _Float16 mn    = *(const _Float16*)(block + 2);
+        unsigned int byte_val = (tid < 16) ? (unsigned int)block[4 + tid] : 0u;
+        unsigned int shared_byte = __shfl(byte_val, tid & 15);
+        unsigned int nibble = (tid < 16) ? (shared_byte & 0xF) : (shared_byte >> 4);
+        _Float16 w = (_Float16)((unsigned short)nibble) * scale + mn;
+        sum += (float)w * x[bi * 32 + tid];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down(sum, offset);
+    }
+    if (tid == 0) y[row] = sum;
+}
+"#;
+
+/// Q4 stored as Q8: 4-bit precision quantized but stored in int8 (1 byte per weight).
+/// Same as Q8_0 format (34 bytes per 32 elements) but values clamped to [-8,7].
+/// Gets Q8 occupancy (16 VGPRs, 84% peak BW) at 4-bit quality.
+/// 1.0625 bytes/weight — only useful when VRAM is not the constraint.
+pub const GEMV_Q4AS8_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Identical to gemv_q8_0 — same format, just the values happen to only use 4 bits.
+// The kernel doesn't know or care that values are clamped to [-8,7].
+// This is here to prove that storage format determines speed, not bit precision.
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_q4as8(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int blocks_per_row = K / 32;
+    const unsigned char* row_data = A_q8 + (size_t)row * blocks_per_row * 34;
+
+    float sum = 0.0f;
+
+    const int outer_iters = blocks_per_row / 8;
+    for (int oi = 0; oi < outer_iters; oi++) {
+        const unsigned char* base = row_data + oi * 8 * 34;
+        const float* xb = x + oi * 256;
+
+        #pragma unroll
+        for (int sub = 0; sub < 8; sub++) {
+            const unsigned char* block = base + sub * 34;
+            float d = (float)*((const _Float16*)block);
+            signed char qval = (signed char)block[2 + tid];
+            sum += d * (float)qval * xb[sub * 32 + tid];
+        }
+    }
+
+    for (int bi = outer_iters * 8; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 34;
+        float d = (float)*((const _Float16*)block);
+        signed char qval = (signed char)block[2 + tid];
+        sum += d * (float)qval * x[bi * 32 + tid];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+    if (tid == 0) y[row] = sum;
+}
+"#;
