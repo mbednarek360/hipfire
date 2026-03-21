@@ -34,6 +34,7 @@ pub enum DType {
     Q4F16G64,  // 36 bytes per 64 elements (RDNA-native FP16 dequant)
     Q4F16G32,  // 20 bytes per 32 elements (RDNA-native FP16 dequant)
     Q8HFQ,     // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
+    HFQ4G256,  // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
     Raw,       // raw bytes, no element interpretation
 }
 
@@ -42,7 +43,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -281,6 +282,34 @@ impl Gpu {
 
         unsafe {
             self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
+        }
+    }
+
+    /// HFQ4-G256 embedding lookup: dequantize one row on GPU, output F32.
+    pub fn embedding_lookup_hfq4g256(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("embedding_hfq4g256", kernels::EMBEDDING_HFQ4G256_SRC, "embedding_hfq4g256")?;
+        let func = &self.functions["embedding_hfq4g256"];
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tid = token_id as i32;
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tid as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
         }
     }
 

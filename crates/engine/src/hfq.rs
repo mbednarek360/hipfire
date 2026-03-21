@@ -279,6 +279,10 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8HFQ, m, k, row_stride })
         }
+        6 => { // HFQ4-G256 — flat 4-bit, 136 bytes per 256 elements
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0 })
+        }
         1 => { // F16 — dequant to F32 for F32 GEMV
             let f32_data: Vec<f32> = data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -306,6 +310,10 @@ pub fn load_weights_hfq(
         // Q4_K: upload raw, use Q4K embedding lookup at inference
         eprintln!("    (Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
         (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q4K)
+    } else if embd_info.0.quant_type == 6 {
+        // HFQ4-G256: upload raw, use HFQ4G256 embedding lookup at inference
+        eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G256)
     } else if embd_info.0.quant_type == 3 {
         // Q8F16: upload raw, use Q8 embedding lookup at inference
         eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);

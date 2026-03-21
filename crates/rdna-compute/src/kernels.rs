@@ -1280,6 +1280,35 @@ extern "C" __global__ void embedding_q4k(
 }
 "#;
 
+/// HFQ4-G256 embedding lookup: dequantize one row from HFQ4-G256 table to F32.
+/// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 elements.
+pub const EMBEDDING_HFQ4G256_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void embedding_hfq4g256(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ output,
+    int token_id, int dim
+) {
+    const int tid = threadIdx.x;
+    const int groups_per_row = dim / 256;
+    const int bytes_per_row = groups_per_row * 136;
+    const unsigned char* row = table + (size_t)token_id * bytes_per_row;
+
+    for (int elem = tid; elem < dim; elem += blockDim.x) {
+        int group = elem / 256;
+        int within = elem % 256;
+        const unsigned char* gptr = row + group * 136;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        int byte_idx = within / 2;
+        unsigned char byte_val = gptr[8 + byte_idx];
+        int nibble = (within % 2 == 0) ? (byte_val & 0xF) : (byte_val >> 4);
+        output[elem] = scale * (float)nibble + zero;
+    }
+}
+"#;
+
 /// Q4_LUT GEMV: 4-bit with LDS codebook lookup.
 /// Block: f16 codebook[16] (32 bytes) + u8 quants[16] (16 bytes) = 48 bytes per 32 elements.
 /// Dequant: nibble → LDS[nibble] → f16 → FMA. No scale arithmetic per element.
