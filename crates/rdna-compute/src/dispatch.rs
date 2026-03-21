@@ -1074,4 +1074,57 @@ impl Gpu {
             )
         }
     }
+
+    /// GPU-side top-K + top-P sampling. Returns (token_id, new_rng_state).
+    /// Eliminates 600KB logits download per token.
+    pub fn sample_top_p(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+    ) -> HipResult<(u32, u32)> {
+        self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
+        let func = &self.functions["sample_top_p"];
+
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut result_ptr = result_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut rng = rng_state;
+
+        let mut params: Vec<*mut std::ffi::c_void> = vec![
+            &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
+            &mut result_ptr as *mut _ as *mut std::ffi::c_void,
+            &mut vs as *mut _ as *mut std::ffi::c_void,
+            &mut temp as *mut _ as *mut std::ffi::c_void,
+            &mut tp as *mut _ as *mut std::ffi::c_void,
+            &mut rng as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let block_size = 256u32;
+        // Shared: reduce[256] + cand_scores[512] + cand_indices[512] + count[1]
+        let shared_mem = (256 + 512 + 512 + 1) * 4;
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                None,
+                &mut params,
+            )?;
+        }
+
+        // Download just 8 bytes: token_id + rng_state
+        let mut out = [0u8; 8];
+        self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
+        let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
+        let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
+        Ok((token_id, new_rng))
+    }
 }

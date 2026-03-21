@@ -813,6 +813,148 @@ pub fn forward(
     Ok(logits_data)
 }
 
+/// Forward pass + GPU-side sampling. Returns (token_id, new_rng_state).
+/// Logits stay on GPU — only 8 bytes downloaded instead of 600KB.
+pub fn forward_sample(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    sample_buf: &GpuTensor,
+    temperature: f32,
+    top_p: f32,
+    rng_state: u32,
+) -> HipResult<(u32, u32)> {
+    // Run forward pass to get logits on GPU
+    let logits_on_gpu = forward_logits_gpu(gpu, weights, config, token, pos, kv_cache)?;
+
+    // Sample on GPU — returns token_id + new rng state
+    let result = gpu.sample_top_p(
+        &logits_on_gpu, sample_buf,
+        config.vocab_size, temperature, top_p, rng_state,
+    )?;
+
+    gpu.free_tensor(logits_on_gpu)?;
+    Ok(result)
+}
+
+/// Forward pass that keeps logits on GPU (no download).
+fn forward_logits_gpu(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut KvCache,
+) -> HipResult<GpuTensor> {
+    let dim = config.dim;
+    let kv_dim = config.n_kv_heads * config.head_dim;
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+
+    let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
+    match weights.embd_format {
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
+    }
+
+    let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
+    let q = gpu.alloc_tensor(&[n_heads * head_dim], DType::F32)?;
+    let k = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+    let v = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+    let attn_out = gpu.alloc_tensor(&[n_heads * head_dim], DType::F32)?;
+    let o = gpu.alloc_tensor(&[dim], DType::F32)?;
+    let gate = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+    let up = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+    let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+    let ffn_out = gpu.alloc_tensor(&[dim], DType::F32)?;
+
+    for layer_idx in 0..config.n_layers {
+        let layer = &weights.layers[layer_idx];
+        gpu.rmsnorm_f32(&x, &layer.attn_norm, &tmp, config.norm_eps)?;
+
+        if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
+            gpu.fused_qkv_q4k(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &tmp, &q, &k, &v,
+                layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.wq, &tmp, &q)?;
+            weight_gemv(gpu, &layer.wk, &tmp, &k)?;
+            weight_gemv(gpu, &layer.wv, &tmp, &v)?;
+        }
+
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                gpu.rmsnorm_batched(&q, qn, &q, n_heads, head_dim, config.norm_eps)?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                gpu.rmsnorm_batched(&k, kn, &k, n_kv_heads, head_dim, config.norm_eps)?;
+            }
+        }
+
+        gpu.rope_f32(&q, &k, pos, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+
+        let cache_byte_offset = pos * kv_dim * 4;
+        gpu.hip.memcpy_dtod_at(
+            &kv_cache.k_gpu[layer_idx].buf, cache_byte_offset,
+            &k.buf, 0, kv_dim * 4,
+        )?;
+        gpu.hip.memcpy_dtod_at(
+            &kv_cache.v_gpu[layer_idx].buf, cache_byte_offset,
+            &v.buf, 0, kv_dim * 4,
+        )?;
+
+        gpu.attention_f32(
+            &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &attn_out, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+        )?;
+
+        weight_gemv(gpu, &layer.wo, &attn_out, &o)?;
+        gpu.add_inplace_f32(&x, &o)?;
+
+        gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
+        if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
+            gpu.fused_gate_up_q4k(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &tmp, &gate, &up,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.w_gate, &tmp, &gate)?;
+            weight_gemv(gpu, &layer.w_up, &tmp, &up)?;
+        }
+
+        gpu.silu_mul_f32(&gate, &up, &ffn_hidden)?;
+        weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
+        gpu.add_inplace_f32(&x, &ffn_out)?;
+    }
+
+    gpu.rmsnorm_f32(&x, &weights.output_norm, &tmp, config.norm_eps)?;
+
+    let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
+    weight_gemv(gpu, &weights.output, &tmp, &logits)?;
+
+    gpu.free_tensor(q)?;
+    gpu.free_tensor(k)?;
+    gpu.free_tensor(v)?;
+    gpu.free_tensor(attn_out)?;
+    gpu.free_tensor(o)?;
+    gpu.free_tensor(gate)?;
+    gpu.free_tensor(up)?;
+    gpu.free_tensor(ffn_hidden)?;
+    gpu.free_tensor(ffn_out)?;
+    gpu.free_tensor(x)?;
+    gpu.free_tensor(tmp)?;
+
+    Ok(logits)
+}
+
 pub fn apply_rope_cpu_pub(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize) {
     apply_rope_cpu(data, n_heads, head_dim, pos, 10000.0);
 }
