@@ -10,14 +10,16 @@ fn main() {
     ];
 
     // Format: (name, bits, block_bytes, group_size, bench_fn_index)
-    struct Fmt { name: &'static str, bits: u32, block_bytes: usize }
+    struct Fmt { name: &'static str, id: u32, block_bytes: usize, group_size: usize }
     let formats = [
-        Fmt { name: "HFQ2-G256", bits: 2, block_bytes: 72 },
-        Fmt { name: "HFQ3-G256", bits: 3, block_bytes: 104 },
-        Fmt { name: "HFQ4-G256", bits: 4, block_bytes: 136 },
-        Fmt { name: "HFQ6-G256", bits: 6, block_bytes: 200 },
-        Fmt { name: "HFQ8-G256", bits: 8, block_bytes: 264 },
-        Fmt { name: "Q4_K(ref)", bits: 0, block_bytes: 144 },
+        Fmt { name: "HFQ2-G256",  id: 2,  block_bytes: 72,  group_size: 256 },
+        Fmt { name: "HFQ3-G256",  id: 3,  block_bytes: 104, group_size: 256 },
+        Fmt { name: "HFQ4-G256",  id: 4,  block_bytes: 136, group_size: 256 },
+        Fmt { name: "HFQ4-G512",  id: 45, block_bytes: 264, group_size: 512 },
+        Fmt { name: "HFQ4-G1024", id: 46, block_bytes: 520, group_size: 1024 },
+        Fmt { name: "HFQ6-G256",  id: 6,  block_bytes: 200, group_size: 256 },
+        Fmt { name: "HFQ8-G256",  id: 8,  block_bytes: 264, group_size: 256 },
+        Fmt { name: "Q4_K(ref)",  id: 0,  block_bytes: 144, group_size: 256 },
     ];
 
     let n = 200;
@@ -27,44 +29,36 @@ fn main() {
     eprintln!("{}", "-".repeat(85));
 
     for fmt in &formats {
-        let bpw = if fmt.bits == 0 { 0.5625 } else { fmt.block_bytes as f64 / 256.0 };
+        let bpw = if fmt.id == 0 { 0.5625 } else { fmt.block_bytes as f64 / fmt.group_size as f64 };
         let mut results = Vec::new();
 
         for &(m, k, _) in sizes {
-            let groups = k / 256;
+            if k % fmt.group_size != 0 { results.push((0.0f32, 0.0f64)); continue; }
+            let groups = k / fmt.group_size;
             let row_bytes = groups * fmt.block_bytes;
             let total = m * row_bytes;
             let d_a = gpu.upload_raw(&vec![0x55u8; total], &[total]).unwrap();
             let d_x = gpu.upload_f32(&vec![0.01f32; k], &[k]).unwrap();
             let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
 
-            // Warmup
-            for _ in 0..10 {
-                match fmt.bits {
-                    2 => gpu.gemv_hfq2g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    3 => gpu.gemv_hfq3g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    4 => gpu.gemv_hfq4g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    6 => gpu.gemv_hfq6g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    8 => gpu.gemv_hfq8g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    0 => gpu.gemv_q4k(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    _ => unreachable!(),
-                }
-            }
+            let run = |gpu: &mut rdna_compute::Gpu| match fmt.id {
+                2 => gpu.gemv_hfq2g256(&d_a, &d_x, &d_y, m, k).unwrap(),
+                3 => gpu.gemv_hfq3g256(&d_a, &d_x, &d_y, m, k).unwrap(),
+                4 => gpu.gemv_hfq4g256(&d_a, &d_x, &d_y, m, k).unwrap(),
+                45 => gpu.gemv_hfq4g512(&d_a, &d_x, &d_y, m, k).unwrap(),
+                46 => gpu.gemv_hfq4g1024(&d_a, &d_x, &d_y, m, k).unwrap(),
+                6 => gpu.gemv_hfq6g256(&d_a, &d_x, &d_y, m, k).unwrap(),
+                8 => gpu.gemv_hfq8g256(&d_a, &d_x, &d_y, m, k).unwrap(),
+                0 => gpu.gemv_q4k(&d_a, &d_x, &d_y, m, k).unwrap(),
+                _ => unreachable!(),
+            };
+
+            for _ in 0..10 { run(&mut gpu); }
 
             let start = gpu.hip.event_create().unwrap();
             let stop = gpu.hip.event_create().unwrap();
             gpu.hip.event_record(&start, None).unwrap();
-            for _ in 0..n {
-                match fmt.bits {
-                    2 => gpu.gemv_hfq2g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    3 => gpu.gemv_hfq3g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    4 => gpu.gemv_hfq4g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    6 => gpu.gemv_hfq6g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    8 => gpu.gemv_hfq8g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    0 => gpu.gemv_q4k(&d_a, &d_x, &d_y, m, k).unwrap(),
-                    _ => unreachable!(),
-                }
-            }
+            for _ in 0..n { run(&mut gpu); }
             gpu.hip.event_record(&stop, None).unwrap();
             gpu.hip.event_synchronize(&stop).unwrap();
             let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap();
