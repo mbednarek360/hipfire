@@ -104,17 +104,13 @@ fn main() {
 
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
-    let mut kv_cache = if use_int8kv {
-        eprintln!("KV cache: INT8 with separate scales (3.88x compression)");
-        KvCache::new_gpu_int8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
-    } else if use_q8kv {
-        eprintln!("KV cache: Q8_0 quantized (3.76x compression)");
-        KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
-    } else if use_q4kv {
-        eprintln!("KV cache: HFQ4 quantized (3.56x compression)");
-        KvCache::new_gpu_q4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
-    } else {
+    let use_fp32kv = args.iter().any(|a| a == "--fp32kv");
+    let mut kv_cache = if use_fp32kv {
+        eprintln!("KV cache: FP32 (unquantized)");
         KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+    } else {
+        // Default: Q8_0 quantized KV cache (3.76x smaller, +7% gen speed)
+        KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     };
 
     // Persistent scratch buffers
