@@ -36,7 +36,7 @@ fn main() {
     let mut skip_next = false;
     for (_i, a) in args.iter().enumerate().skip(2) {
         if skip_next { skip_next = false; continue; }
-        if a == "--temp" || a == "--debug" || a == "--q4kv" || a == "--q8kv" || a == "--int8kv" || a == "--repeat-penalty" || a == "--repeat-window" {
+        if a == "--temp" || a == "--debug" || a == "--q4kv" || a == "--q8kv" || a == "--int8kv" || a == "--hfq4kv" || a == "--fp32kv" || a == "--repeat-penalty" || a == "--repeat-window" {
             if a == "--temp" || a == "--repeat-penalty" || a == "--repeat-window" { skip_next = true; }
             continue;
         }
@@ -105,7 +105,11 @@ fn main() {
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
     let use_fp32kv = args.iter().any(|a| a == "--fp32kv");
-    let mut kv_cache = if use_fp32kv {
+    let use_hfq4kv = args.iter().any(|a| a == "--hfq4kv");
+    let mut kv_cache = if use_hfq4kv {
+        eprintln!("KV cache: HFQ4 co-located blocks (3.56x compression)");
+        KvCache::new_gpu_hfq4kv(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+    } else if use_fp32kv {
         eprintln!("KV cache: FP32 (unquantized)");
         KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else {

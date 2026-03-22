@@ -2330,6 +2330,164 @@ extern "C" __global__ void attention_q8kv(
 }
 "#;
 
+/// HFQ4 KV block: co-located FP32 scale+zero + packed nibbles. 72 bytes per head.
+/// Layout per position: [n_kv_heads × 72] bytes. One cache line per head.
+pub const KV_CACHE_WRITE_HFQ4_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_hfq4(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;  // 0..31
+    const int pos = pos_buf[0];
+
+    const float* head_src = src + h * head_dim;
+
+    // Each thread handles 4 elements (32 threads × 4 = 128)
+    float v0 = (tid * 4 < head_dim) ? head_src[tid * 4] : 0.0f;
+    float v1 = (tid * 4 + 1 < head_dim) ? head_src[tid * 4 + 1] : 0.0f;
+    float v2 = (tid * 4 + 2 < head_dim) ? head_src[tid * 4 + 2] : 0.0f;
+    float v3 = (tid * 4 + 3 < head_dim) ? head_src[tid * 4 + 3] : 0.0f;
+
+    // Warp min/max
+    float local_min = fminf(fminf(v0, v1), fminf(v2, v3));
+    float local_max = fmaxf(fmaxf(v0, v1), fmaxf(v2, v3));
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_min = fminf(local_min, __shfl_xor(local_min, offset));
+        local_max = fmaxf(local_max, __shfl_xor(local_max, offset));
+    }
+
+    float scale = (local_max - local_min) / 15.0f;
+    float zero = local_min;
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    // Block: [4B scale][4B zero][head_dim/2 nibbles]
+    int bytes_per_block = 8 + head_dim / 2;
+    int bytes_per_pos = n_kv_heads * bytes_per_block;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_block;
+
+    if (tid == 0) {
+        *(float*)(out) = scale;
+        *(float*)(out + 4) = zero;
+    }
+
+    // Quantize 4 values → 2 bytes (4 nibbles)
+    int q0 = __float2int_rn((v0 - zero) * inv_scale); q0 = max(0, min(15, q0));
+    int q1 = __float2int_rn((v1 - zero) * inv_scale); q1 = max(0, min(15, q1));
+    int q2 = __float2int_rn((v2 - zero) * inv_scale); q2 = max(0, min(15, q2));
+    int q3 = __float2int_rn((v3 - zero) * inv_scale); q3 = max(0, min(15, q3));
+
+    out[8 + tid * 2]     = (unsigned char)((q1 << 4) | q0);
+    out[8 + tid * 2 + 1] = (unsigned char)((q3 << 4) | q2);
+}
+"#;
+
+/// Attention with HFQ4 KV blocks. 72 bytes per head, co-located scale+zero+nibbles.
+pub const ATTENTION_HFQ4_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_hfq4_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const float* q_head = q + h * head_dim;
+    const int bytes_per_block = 8 + head_dim / 2;
+    const int bytes_per_pos = n_kv_heads * bytes_per_block;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T with HFQ4 dequant
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* block = k_cache + (size_t)t * bytes_per_pos + kv_h * bytes_per_block;
+        float k_scale = *(const float*)(block);
+        float k_zero  = *(const float*)(block + 4);
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d += 2) {
+            unsigned char byte_val = block[8 + d / 2];
+            float k0 = k_scale * (float)(byte_val & 0xF) + k_zero;
+            float k1 = k_scale * (float)(byte_val >> 4) + k_zero;
+            dot += q_head[d] * k0 + q_head[d + 1] * k1;
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted V sum with HFQ4 dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        int byte_idx = d / 2;
+        int is_high = d & 1;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* block = v_cache + (size_t)t * bytes_per_pos + kv_h * bytes_per_block;
+            float v_scale = *(const float*)(block);
+            float v_zero  = *(const float*)(block + 4);
+            unsigned char bv = block[8 + byte_idx];
+            float v_val = v_scale * (float)(is_high ? (bv >> 4) : (bv & 0xF)) + v_zero;
+            val += scores[t] * v_val;
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
 /// Quantize KV vector to HFQ4-G128 and write to quantized KV cache.
 /// Input: kv_dim floats at kv_src. Output: packed HFQ4 at dst[pos * bytes_per_pos].
 /// Each group of 128 floats → 72 bytes (4B scale + 4B zero + 64B nibbles).
