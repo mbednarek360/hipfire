@@ -625,15 +625,18 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
+        // Use wide kernel (2 rows/block) for large M, narrow for small
+        if m >= 64 {
+            self.ensure_kernel("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC, "gemv_hfq4g256_wide")?;
+            let wfunc = &self.functions["gemv_hfq4g256_wide"];
+            let grid = ((m + 1) / 2) as u32;
+            unsafe {
+                self.hip.launch_kernel(wfunc, [grid, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            }
+        } else {
+            unsafe {
+                self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+            }
         }
     }
 
