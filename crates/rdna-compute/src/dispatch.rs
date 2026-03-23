@@ -2258,9 +2258,9 @@ impl Gpu {
             &mut op as *mut _ as *mut c_void, &mut nt as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
         ];
-        // 128 threads = 4 warps of 32. One thread per row of S.
-        // S matrix in global memory (fits in L2 cache).
-        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 4, 1], 0, self.stream_ref(), &mut params) }
+        // 128 threads (4 warps), one per S-row. k,q in LDS for broadcast.
+        // Fused S update + output in one pass per row.
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [128, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
     /// Alpha gate compute: alpha[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i])).
