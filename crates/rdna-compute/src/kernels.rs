@@ -3109,8 +3109,10 @@ extern "C" __global__ void conv1d_decode_f32(
     float s1 = state[c * 3 + 1];
     float s2 = state[c * 3 + 2];
 
-    output[c] = weight[c] * x + weight[n_channels + c] * s0
-              + weight[2 * n_channels + c] * s1 + weight[3 * n_channels + c] * s2;
+    // weight layout: [n_channels, 4] from safetensors [channels, 1, kernel_size]
+    // PyTorch conv1d: weight[0] = oldest, weight[3] = newest (current)
+    output[c] = weight[c * 4 + 3] * x + weight[c * 4 + 2] * s0
+              + weight[c * 4 + 1] * s1 + weight[c * 4] * s2;
 
     state[c * 3 + 2] = s1;
     state[c * 3 + 1] = s0;

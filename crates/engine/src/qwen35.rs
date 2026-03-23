@@ -401,18 +401,19 @@ pub fn forward(
                 weight_gemv(gpu, &layer.w_beta, &tmp, &beta_out)?;
                 gpu.sigmoid_f32(&beta_out)?;
 
-                // Alpha projection + softplus(alpha + dt_bias) * (-A_log.exp())
+                // Alpha projection: gate = softplus(alpha + dt_bias) * A_log
+                // (llama.cpp multiplies raw A_log, not -exp(A_log))
                 let alpha_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
                 weight_gemv(gpu, &layer.w_alpha, &tmp, &alpha_out)?;
-                // alpha = softplus(alpha + dt_bias) * A (where A = -exp(A_log))
-                // For now: compute on CPU (tiny: 16 elements)
                 let mut alpha_cpu = gpu.download_f32(&alpha_out)?;
                 let dt_bias_cpu = gpu.download_f32(&layer.dt_bias)?;
                 let a_log_cpu = gpu.download_f32(&layer.a_log)?;
                 for i in 0..n_v_heads {
                     let biased = alpha_cpu[i] + dt_bias_cpu[i];
                     let sp = if biased > 20.0 { biased } else if biased < -20.0 { biased.exp() } else { (1.0 + biased.exp()).ln() };
-                    alpha_cpu[i] = sp * (-a_log_cpu[i].exp()); // negative decay rate
+                    // llama.cpp's ssm_a = -exp(A_log) (converted during GGUF export)
+                    // We apply the same conversion here since we load raw A_log from safetensors
+                    alpha_cpu[i] = sp * (-a_log_cpu[i].exp());
                 }
                 let alpha_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(alpha_cpu.as_ptr() as *const u8, alpha_cpu.len() * 4)
@@ -494,16 +495,19 @@ pub fn forward(
                 let q_full = gpu.alloc_tensor(&[q_full_dim], DType::F32)?;
                 weight_gemv(gpu, &layer.wq, &tmp, &q_full)?;
 
-                // Split Q into query and gate
+                // Split Q into query and gate — interleaved per head:
+                // [Q_h0(256), Gate_h0(256), Q_h1(256), Gate_h1(256), ...]
                 let q_dim = config.n_heads * config.head_dim;
                 let q = gpu.alloc_tensor(&[q_dim], DType::F32)?;
                 let gate_vec = gpu.alloc_tensor(&[q_dim], DType::F32)?;
-                // Q is at even indices, gate at odd (interleaved per head)
-                // Actually: first half is Q, second half is gate (based on llama.cpp view with stride 2)
-                // llama.cpp: Qcur = view with stride n_embd_head*2, gate = view at offset n_embd_head
-                // Simpler: Q = first q_dim elements, gate = second q_dim elements
-                gpu.hip.memcpy_dtod_at(&q.buf, 0, &q_full.buf, 0, q_dim * 4)?;
-                gpu.hip.memcpy_dtod_at(&gate_vec.buf, 0, &q_full.buf, q_dim * 4, q_dim * 4)?;
+                // Extract interleaved: for each head, copy head_dim floats with stride 2*head_dim
+                for h in 0..config.n_heads {
+                    let src_q_off = h * config.head_dim * 2 * 4;
+                    let src_g_off = (h * config.head_dim * 2 + config.head_dim) * 4;
+                    let dst_off = h * config.head_dim * 4;
+                    gpu.hip.memcpy_dtod_at(&q.buf, dst_off, &q_full.buf, src_q_off, config.head_dim * 4)?;
+                    gpu.hip.memcpy_dtod_at(&gate_vec.buf, dst_off, &q_full.buf, src_g_off, config.head_dim * 4)?;
+                }
 
                 // Q norm
                 gpu.rmsnorm_batched(&q, &layer.q_norm, &q, config.n_heads, config.head_dim, config.norm_eps)?;

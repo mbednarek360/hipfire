@@ -68,7 +68,7 @@ fn main() {
         chat.extend_from_slice(&im_start); chat.extend_from_slice(&asst); chat.extend_from_slice(&nl);
         prompt_tokens = chat;
     }
-    eprintln!("Prompt: \"{}\" → {} tokens", prompt_text, prompt_tokens.len());
+    eprintln!("Prompt: \"{}\" → {} tokens: {:?}", prompt_text, prompt_tokens.len(), &prompt_tokens[..prompt_tokens.len().min(10)]);
 
     // Process prompt
     let t1 = Instant::now();
@@ -83,17 +83,35 @@ fn main() {
         prompt_ms, prompt_tokens.len(),
         prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
 
+    // Debug: check logit distribution
+    let top5: Vec<(usize, f32)> = {
+        let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.into_iter().take(5).collect()
+    };
+    eprintln!("Top 5 logits after prompt:");
+    for (id, val) in &top5 {
+        let text = tokenizer.decode(&[*id as u32]);
+        eprintln!("  id={id} logit={val:.4} text={text:?}");
+    }
+    let has_nan = logits.iter().any(|v| v.is_nan());
+    let has_inf = logits.iter().any(|v| v.is_infinite());
+    eprintln!("NaN: {has_nan}, Inf: {has_inf}, min: {:.4}, max: {:.4}",
+        logits.iter().cloned().fold(f32::INFINITY, f32::min),
+        logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+
     // Generate
     let max_gen = 128;
     let t2 = Instant::now();
     let mut next_token = engine::llama::argmax(&logits);
     let mut generated = Vec::new();
 
-    for _ in 0..max_gen {
+    for gi in 0..max_gen {
         generated.push(next_token);
         let text = tokenizer.decode(&[next_token]);
         print!("{text}");
         std::io::stdout().flush().ok();
+        if gi < 5 { eprintln!("[gen {gi}: id={next_token} text={text:?}]"); }
 
         if next_token == config.eos_token { break; }
 
