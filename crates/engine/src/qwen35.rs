@@ -185,6 +185,23 @@ fn load_f16_tensor(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) ->
     gpu.upload_f32(&f32_data, shape)
 }
 
+/// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight))
+fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+    let full_name = format!("model.language_model.{name}");
+    let (info, data) = hfq.tensor_data(&full_name)
+        .or_else(|| hfq.tensor_data(name))
+        .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
+
+    let mut f32_data: Vec<f32> = match info.quant_type {
+        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
+    };
+    // Qwen3.5 RMSNorm: output = x * rsqrt(var+eps) * (1 + weight)
+    for v in &mut f32_data { *v += 1.0; }
+    gpu.upload_f32(&f32_data, shape)
+}
+
 fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
     let full_name = format!("model.language_model.{name}");
     let (info, data) = hfq.tensor_data(&full_name)
@@ -271,7 +288,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
     };
 
     eprintln!("  loading output_norm...");
-    let output_norm = load_f16_tensor(hfq, gpu, "norm.weight", &[config.dim])?;
+    let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
 
     eprintln!("  loading output (tied embeddings)...");
     // Qwen3.5 uses tied embeddings — output = embed_tokens
@@ -303,7 +320,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                 let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
 
                 layers.push(LayerWeights::DeltaNet(DeltaNetLayerWeights {
-                    attn_norm: load_f16_tensor(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
                     wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
                     wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
                     w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
@@ -316,7 +333,7 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                         qkv_dim * config.conv_kernel_dim)?,  // flatten [channels, 1, kernel] → [channels * kernel]
                     norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
                     wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
-                    ffn_norm: load_f16_tensor(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
                     w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
                     w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
                     w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
@@ -327,14 +344,14 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
                 let kv_dim = config.n_kv_heads * config.head_dim;
 
                 layers.push(LayerWeights::FullAttn(FullAttnLayerWeights {
-                    attn_norm: load_f16_tensor(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
                     wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
                     wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
                     wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
                     wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
-                    q_norm: load_f16_tensor(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
-                    k_norm: load_f16_tensor(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
-                    ffn_norm: load_f16_tensor(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
+                    k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
+                    ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
                     w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
                     w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
                     w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
@@ -378,11 +395,7 @@ pub fn forward(
 
     let mut delta_layer_idx = 0usize;
 
-    // Debug: embedding output
-    if pos == 19 {
-        let hid = gpu.download_f32(&x)?;
-        eprintln!("EMB: {:?}", &hid[..8].iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>());
-    }
+    // (embedding debug removed)
 
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -589,22 +602,7 @@ pub fn forward(
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
 
-        // Per-layer hidden state dump (last prompt token only)
-        if pos == 19 {
-            let hid = gpu.download_f32(&x)?;
-            let lt = match config.layer_types[layer_idx] { LayerType::LinearAttention => "D", LayerType::FullAttention => "F" };
-            eprintln!("L{layer_idx:02}({lt}): {:?}", &hid[..8].iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>());
-        }
-    }
-
-    // Debug: dump hidden state before and after final norm
-    {
-        let hid = gpu.download_f32(&x)?;
-        let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
-        eprintln!("DEBUG pre-norm: first8={:?} norm={:.4}", &hid[..8], norm);
-        let norm_w = gpu.download_f32(&weights.output_norm)?;
-        eprintln!("DEBUG norm_weight: first8={:?} norm={:.4}", &norm_w[..8],
-            norm_w.iter().map(|v| v * v).sum::<f32>().sqrt());
+        // (per-layer debug removed)
     }
 
     // Final norm + output projection

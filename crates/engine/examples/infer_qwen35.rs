@@ -49,9 +49,9 @@ fn main() {
     eprintln!("DeltaNet state: {} S matrices, {} conv states",
         dn_state.s_matrices.len(), dn_state.conv_states.len());
 
-    // Tokenize with ChatML
+    // Tokenize with ChatML (skip if NO_CHATML env var set)
     let mut prompt_tokens = tokenizer.encode(&prompt_text);
-    let has_chatml = tokenizer.encode("<|im_start|>").len() == 1;
+    let has_chatml = tokenizer.encode("<|im_start|>").len() == 1 && std::env::var("NO_CHATML").is_err();
     if has_chatml {
         let im_start = tokenizer.encode("<|im_start|>");
         let im_end = tokenizer.encode("<|im_end|>");
