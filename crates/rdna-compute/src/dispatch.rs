@@ -36,6 +36,7 @@ pub enum DType {
     Q8HFQ,     // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
     HFQ4G256,  // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
     HFQ4G128,  // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
+    HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     Raw,       // raw bytes, no element interpretation
 }
 
@@ -44,7 +45,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ6G256 | DType::Raw => 1, // byte-level
         }
     }
 }
