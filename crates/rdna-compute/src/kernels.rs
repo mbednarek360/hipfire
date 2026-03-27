@@ -2766,6 +2766,143 @@ extern "C" __global__ void kv_cache_write_hfq4(
 }
 "#;
 
+/// HFQ4 KV with sign-flip decorrelation. Same format as HFQ4 (72B/head),
+/// but values are multiplied by TURBO_SIGNS1 before quantization.
+/// On read: Q is sign-flipped, V output is sign-flipped.
+pub const KV_CACHE_WRITE_HFQ4S_SRC: &str = r#"
+extern "C" __global__ void kv_cache_write_hfq4s(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    int n_kv_heads, int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+    const float* head_src = src + h * head_dim;
+    const int d0 = tid * 4;
+
+    // Load with sign flip decorrelation
+    float v0 = head_src[d0]     * TURBO_SIGNS1[d0];
+    float v1 = head_src[d0 + 1] * TURBO_SIGNS1[d0 + 1];
+    float v2 = head_src[d0 + 2] * TURBO_SIGNS1[d0 + 2];
+    float v3 = head_src[d0 + 3] * TURBO_SIGNS1[d0 + 3];
+
+    // Warp min/max
+    float local_min = fminf(fminf(v0, v1), fminf(v2, v3));
+    float local_max = fmaxf(fmaxf(v0, v1), fmaxf(v2, v3));
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_min = fminf(local_min, __shfl_xor(local_min, offset));
+        local_max = fmaxf(local_max, __shfl_xor(local_max, offset));
+    }
+
+    float scale = (local_max - local_min) / 15.0f;
+    float zero = local_min;
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    int bytes_per_block = 8 + head_dim / 2;
+    int bytes_per_pos = n_kv_heads * bytes_per_block;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_block;
+
+    if (tid == 0) {
+        *(float*)(out) = scale;
+        *(float*)(out + 4) = zero;
+    }
+
+    int q0 = __float2int_rn((v0 - zero) * inv_scale); q0 = max(0, min(15, q0));
+    int q1 = __float2int_rn((v1 - zero) * inv_scale); q1 = max(0, min(15, q1));
+    int q2 = __float2int_rn((v2 - zero) * inv_scale); q2 = max(0, min(15, q2));
+    int q3 = __float2int_rn((v3 - zero) * inv_scale); q3 = max(0, min(15, q3));
+
+    out[8 + tid * 2]     = (unsigned char)((q1 << 4) | q0);
+    out[8 + tid * 2 + 1] = (unsigned char)((q3 << 4) | q2);
+}
+"#;
+
+/// Attention with HFQ4+sign-flip KV: Q sign-flipped before dot, V output sign-flipped.
+/// Same HFQ4 block format (72B/head). Uses TURBO_SIGNS1 from constant memory.
+pub const ATTENTION_HFQ4S_KV_SRC: &str = r#"
+extern "C" __global__ void attention_hfq4s_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads, int n_kv_heads, int head_dim, int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int bpb = 8 + head_dim / 2;
+    const int bpp = n_kv_heads * bpb;
+
+    float* scores = sdata;
+    float* ws = sdata + seq_len;
+    float* q_sh = ws + nthreads;
+
+    // Preload Q with sign flip (matches sign-flipped K in cache)
+    const float* q_head = q + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_sh[d] = q_head[d] * TURBO_SIGNS1[d];
+    __syncthreads();
+
+    // Phase 1: Q_signed @ K_signed^T — signs cancel, result = Q @ K^T
+    float lmax = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* blk = k_cache + (size_t)t * bpp + kv_h * bpb;
+        float sc = *(const float*)(blk);
+        float zr = *(const float*)(blk + 4);
+        float dot = 0.0f;
+        for (int j = 0; j < head_dim / 2; j++) {
+            unsigned char pk = blk[8 + j];
+            dot += q_sh[j * 2]     * (sc * (float)(pk & 0xF) + zr)
+                 + q_sh[j * 2 + 1] * (sc * (float)(pk >> 4) + zr);
+        }
+        scores[t] = dot * scale_attn;
+        lmax = fmaxf(lmax, scores[t]);
+    }
+
+    ws[tid] = lmax;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]); __syncthreads(); }
+    float max_val = ws[0]; __syncthreads();
+
+    float lsum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) { float e = expf(scores[t] - max_val); scores[t] = e; lsum += e; }
+    ws[tid] = lsum; __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] += ws[tid + s]; __syncthreads(); }
+    float sv = ws[0]; __syncthreads();
+    for (int t = tid; t < seq_len; t += nthreads) scores[t] /= sv;
+    __syncthreads();
+
+    // Phase 2: weighted V sum — then inverse sign flip
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        int byte_idx = d / 2;
+        int is_high = d & 1;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* blk = v_cache + (size_t)t * bpp + kv_h * bpb;
+            float sc = *(const float*)(blk);
+            float zr = *(const float*)(blk + 4);
+            unsigned char pk = blk[8 + byte_idx];
+            val += scores[t] * (sc * (float)(is_high ? (pk >> 4) : (pk & 0xF)) + zr);
+        }
+        // Inverse sign flip: multiply by same signs (sign^2 = 1)
+        out_head[d] = val * TURBO_SIGNS1[d];
+    }
+}
+"#;
+
 /// Attention with HFQ4 KV blocks v2. Tight single-block pattern.
 /// 72 bytes per head = one HFQ4-G128 block (scale+zero+64 nibble bytes).
 /// Q preloaded into shared memory. One scale+zero load per position.
@@ -4418,68 +4555,108 @@ __device__ int turbo_quantize_4bit(float x) {
          + (x > 0.022760f) + (x > 0.046139f) + (x > 0.070622f) + (x > 0.097139f)
          + (x > 0.127014f) + (x > 0.162944f) + (x > 0.212220f);
 }
+
+// Sign flip array for cheap decorrelation (seed=42, ±1.0)
+__constant__ float TURBO_SIGNS1[128] = {
+  1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f,
+  1.0f, 1.0f, 1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,-1.0f,
+  1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f,
+ -1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,-1.0f,
+  1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,
+  1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f,
+  1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f, 1.0f,
+  1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f
+};
 "#;
 
 /// KV cache write kernel for turbo_hfq4 (4-bit).
 /// Layout per head: [f32 norm (4B)][nibbles × head_dim/2 (64B)] = 68 bytes for head_dim=128.
 /// One block per kv_head, thread 0 does all work (head_dim=128 is serial per head).
 pub const KV_CACHE_WRITE_TURBO4_SRC: &str = r#"
-// turbo_common preamble is prepended by the compiler
-
+// Fused K+V write for turbo_hfq4. 32 threads, parallel FWHT + 4-bit quantize.
 extern "C" __global__ void kv_cache_write_turbo4(
-    unsigned char* __restrict__ dst,
-    const float* __restrict__ src,
+    unsigned char* __restrict__ k_dst,
+    unsigned char* __restrict__ v_dst,
+    const float* __restrict__ k_src,
+    const float* __restrict__ v_src,
     const int* __restrict__ pos_buf,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
-    int n_kv_heads,
-    int head_dim
+    int n_kv_heads, int head_dim
 ) {
     const int h = blockIdx.x;
     if (h >= n_kv_heads) return;
-    if (threadIdx.x != 0) return;  // single thread per head
-
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
     const int pos = pos_buf[0];
-    const float* head_src = src + h * head_dim;
-    const int bytes_per_head = 4 + head_dim / 2;  // f32 norm + nibbles
+
+    const int bytes_per_head = 4 + head_dim / 2;  // 68 for hd=128
     const int bytes_per_pos = n_kv_heads * bytes_per_head;
-    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
 
-    float x[128];
+    extern __shared__ float smem[];
+    float* x = smem;
+    float* scratch = smem + head_dim;
 
-    // Load and compute L2 norm
-    float norm_sq = 0.0f;
-    for (int i = 0; i < head_dim; i++) {
-        x[i] = head_src[i];
-        norm_sq += x[i] * x[i];
-    }
-    float orig_norm = sqrtf(norm_sq);
-    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
+    for (int kv = 0; kv < 2; kv++) {
+        const float* src = (kv == 0) ? (k_src + h * head_dim) : (v_src + h * head_dim);
+        unsigned char* out = ((kv == 0) ? k_dst : v_dst) + (size_t)pos * bytes_per_pos + h * bytes_per_head;
 
-    // Normalize
-    for (int i = 0; i < head_dim; i++) x[i] *= inv_norm;
+        for (int d = tid; d < head_dim; d += nthreads) x[d] = src[d];
+        __syncthreads();
 
-    // FWHT rotate
-    fwht_forward_128(x, signs1, signs2);
+        // Parallel L2 norm
+        float lsq = 0.0f;
+        for (int d = tid; d < head_dim; d += nthreads) lsq += x[d] * x[d];
+        scratch[tid] = lsq;
+        __syncthreads();
+        for (int s = 16; s > 0; s >>= 1) { if (tid < s) scratch[tid] += scratch[tid + s]; __syncthreads(); }
+        float orig_norm = sqrtf(scratch[0]);
+        float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
 
-    // Quantize to 4-bit and compute reconstruction norm
-    unsigned char indices[128];
-    float recon_sq = 0.0f;
-    for (int i = 0; i < head_dim; i++) {
-        int idx = turbo_quantize_4bit(x[i]);
-        indices[i] = (unsigned char)idx;
-        float c = TURBO_C4[idx];
-        recon_sq += c * c;
-    }
+        for (int d = tid; d < head_dim; d += nthreads) x[d] *= inv_norm;
+        __syncthreads();
 
-    // Corrected norm: guarantees exact L2 norm preservation
-    float recon_norm = sqrtf(recon_sq);
-    float corrected_norm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
+        // Parallel FWHT
+        for (int d = tid; d < head_dim; d += nthreads) x[d] *= signs1[d];
+        __syncthreads();
+        for (int stride = 1; stride <= 2; stride <<= 1) {
+            for (int base = tid; base < head_dim / 2; base += nthreads) {
+                int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
+                float a = x[i], b = x[i + stride]; x[i] = a + b; x[i + stride] = a - b;
+            }
+        }
+        __syncthreads();
+        for (int stride = 4; stride < head_dim; stride <<= 1) {
+            for (int base = tid; base < head_dim / 2; base += nthreads) {
+                int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
+                float a = x[i], b = x[i + stride]; x[i] = a + b; x[i + stride] = a - b;
+            }
+            __syncthreads();
+        }
+        const float inv_sqrt = 0.08838834764831845f;
+        for (int d = tid; d < head_dim; d += nthreads) x[d] *= inv_sqrt * signs2[d];
+        __syncthreads();
 
-    // Write: [f32 corrected_norm][nibbles]
-    *(float*)out = corrected_norm;
-    for (int i = 0; i < head_dim; i += 2) {
-        out[4 + i/2] = (indices[i] & 0xF) | (indices[i+1] << 4);
+        // 4-bit quantize (each thread handles 4 dims = 2 nibble bytes)
+        const int dpt = head_dim / nthreads;
+        const int d0 = tid * dpt;
+        float local_rsq = 0.0f;
+        int idx0, idx1, idx2, idx3;
+        idx0 = turbo_quantize_4bit(x[d0]);     local_rsq += TURBO_C4[idx0] * TURBO_C4[idx0];
+        idx1 = turbo_quantize_4bit(x[d0 + 1]); local_rsq += TURBO_C4[idx1] * TURBO_C4[idx1];
+        idx2 = turbo_quantize_4bit(x[d0 + 2]); local_rsq += TURBO_C4[idx2] * TURBO_C4[idx2];
+        idx3 = turbo_quantize_4bit(x[d0 + 3]); local_rsq += TURBO_C4[idx3] * TURBO_C4[idx3];
+
+        scratch[tid] = local_rsq;
+        __syncthreads();
+        for (int s = 16; s > 0; s >>= 1) { if (tid < s) scratch[tid] += scratch[tid + s]; __syncthreads(); }
+        float recon_norm = sqrtf(scratch[0]);
+        float cnorm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
+        if (tid == 0) *(float*)out = cnorm;
+        // Pack 4 nibbles into 2 bytes
+        out[4 + tid * 2]     = (unsigned char)((idx1 << 4) | (idx0 & 0xF));
+        out[4 + tid * 2 + 1] = (unsigned char)((idx3 << 4) | (idx2 & 0xF));
+        __syncthreads();
     }
 }
 "#;
@@ -4723,6 +4900,7 @@ extern "C" __global__ void kv_cache_write_turbo2(
 /// One wavefront (32 threads) per attention head.
 /// Q is pre-rotated in shared memory, V output is inverse-rotated.
 pub const ATTENTION_TURBO4_KV_SRC: &str = r#"
+// Optimized turbo4 attention: dim-parallel, warp-shuffle K dots, parallel FWHT.
 extern "C" __global__ void attention_turbo4_kv(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_cache,
@@ -4731,120 +4909,123 @@ extern "C" __global__ void attention_turbo4_kv(
     const int* __restrict__ pos_buf,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
-    int n_heads,
-    int n_kv_heads,
-    int head_dim,
-    int max_seq,
+    int n_heads, int n_kv_heads, int head_dim, int max_seq,
     float scale_attn
 ) {
     int seq_len = pos_buf[0] + 1;
     extern __shared__ float sdata[];
-
     const int h = blockIdx.x;
     if (h >= n_heads) return;
-
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
 
-    const int bytes_per_head = 4 + head_dim / 2;  // 68 for hd=128
+    const int bytes_per_head = 4 + head_dim / 2;  // 68
     const int bytes_per_pos = n_kv_heads * bytes_per_head;
     const int kv_head_off = kv_h * bytes_per_head;
+    const int dpt = head_dim / nthreads;  // 4
+    const int d0 = tid * dpt;
 
     float* scores = sdata;
-    float* workspace = sdata + seq_len;
-    float* q_rotated = workspace + nthreads;  // head_dim floats
+    float* q_rot = sdata + seq_len;
 
-    // Load Q into shared memory and rotate
-    for (int d = tid; d < head_dim; d += nthreads)
-        q_rotated[d] = q[h * head_dim + d];
+    // Parallel FWHT on Q
+    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] = q[h * head_dim + d];
     __syncthreads();
-    if (tid == 0) fwht_forward_128(q_rotated, signs1, signs2);
+    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= signs1[d];
+    __syncthreads();
+    for (int stride = 1; stride <= 2; stride <<= 1) {
+        for (int base = tid; base < head_dim / 2; base += nthreads) {
+            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
+            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
+        }
+    }
+    __syncthreads();
+    for (int stride = 4; stride < head_dim; stride <<= 1) {
+        for (int base = tid; base < head_dim / 2; base += nthreads) {
+            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
+            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
+        }
+        __syncthreads();
+    }
+    const float inv_sqrt = 0.08838834764831845f;
+    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= inv_sqrt * signs2[d];
     __syncthreads();
 
-    // Phase 1: Q_rotated @ K_turbo^T
-    float local_max = -1e30f;
-    for (int t = tid; t < seq_len; t += nthreads) {
+    float mq[4];
+    for (int i = 0; i < dpt; i++) mq[i] = q_rot[d0 + i];
+
+    // K dot: each thread reads 2 nibble bytes (4 dims), warp-shuffle reduce
+    for (int t = 0; t < seq_len; t++) {
         const unsigned char* kb = k_cache + (size_t)t * bytes_per_pos + kv_head_off;
         float cnorm = *(const float*)kb;
-
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d += 2) {
-            unsigned char packed = kb[4 + d/2];
-            dot += TURBO_C4[packed & 0xF] * cnorm * q_rotated[d];
-            dot += TURBO_C4[packed >> 4]  * cnorm * q_rotated[d + 1];
-        }
-        float s = dot * scale_attn;
-        scores[t] = s;
-        local_max = fmaxf(local_max, s);
+        unsigned char b0 = kb[4 + tid * 2];
+        unsigned char b1 = kb[4 + tid * 2 + 1];
+        float partial = TURBO_C4[b0 & 0xF] * mq[0]
+                       + TURBO_C4[b0 >> 4]  * mq[1]
+                       + TURBO_C4[b1 & 0xF] * mq[2]
+                       + TURBO_C4[b1 >> 4]  * mq[3];
+        partial *= cnorm;
+        for (int off = 16; off > 0; off >>= 1) partial += __shfl_xor(partial, off);
+        if (tid == 0) scores[t] = partial * scale_attn;
     }
-
-    // Reduce max
-    workspace[tid] = local_max;
-    __syncthreads();
-    for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
-        __syncthreads();
-    }
-    float max_val = workspace[0];
     __syncthreads();
 
-    // Softmax exp + sum
-    float local_sum = 0.0f;
+    // Parallel softmax
+    float lmx = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) lmx = fmaxf(lmx, scores[t]);
+    for (int off = 16; off > 0; off >>= 1) lmx = fmaxf(lmx, __shfl_xor(lmx, off));
+    float mx = lmx;
+    float lsm = 0.0f;
     for (int t = tid; t < seq_len; t += nthreads) {
-        float e = expf(scores[t] - max_val);
-        scores[t] = e;
-        local_sum += e;
+        float e = expf(scores[t] - mx); scores[t] = e; lsm += e;
     }
-    workspace[tid] = local_sum;
+    for (int off = 16; off > 0; off >>= 1) lsm += __shfl_xor(lsm, off);
     __syncthreads();
-    for (int s = nthreads / 2; s > 0; s >>= 1) {
-        if (tid < s) workspace[tid] += workspace[tid + s];
-        __syncthreads();
-    }
-    float sum_val = workspace[0];
-    __syncthreads();
-    for (int t = tid; t < seq_len; t += nthreads)
-        scores[t] /= sum_val;
+    float inv_sum = 1.0f / lsm;
+    for (int t = tid; t < seq_len; t += nthreads) scores[t] *= inv_sum;
     __syncthreads();
 
-    // Phase 2: weighted V sum (in rotated space)
-    float out_rotated[128];
-    for (int d = 0; d < head_dim; d++) out_rotated[d] = 0.0f;
-
-    // Each thread processes a chunk of positions
-    for (int t = tid; t < seq_len; t += nthreads) {
+    // V weighted sum: each thread owns 4 dims (2 nibble bytes)
+    float mv[4] = {0, 0, 0, 0};
+    for (int t = 0; t < seq_len; t++) {
         float w = scores[t];
         if (w < 1e-8f) continue;
         const unsigned char* vb = v_cache + (size_t)t * bytes_per_pos + kv_head_off;
-        float cnorm_v = *(const float*)vb;
-        for (int d = 0; d < head_dim; d += 2) {
-            unsigned char packed = vb[4 + d/2];
-            out_rotated[d]     += w * TURBO_C4[packed & 0xF] * cnorm_v;
-            out_rotated[d + 1] += w * TURBO_C4[packed >> 4]  * cnorm_v;
-        }
+        float wn = w * *(const float*)vb;
+        unsigned char b0 = vb[4 + tid * 2];
+        unsigned char b1 = vb[4 + tid * 2 + 1];
+        mv[0] += wn * TURBO_C4[b0 & 0xF];
+        mv[1] += wn * TURBO_C4[b0 >> 4];
+        mv[2] += wn * TURBO_C4[b1 & 0xF];
+        mv[3] += wn * TURBO_C4[b1 >> 4];
     }
 
-    // Reduce V partial sums across threads, store directly in q_rotated
-    for (int d = 0; d < head_dim; d++) {
-        workspace[tid] = out_rotated[d];
-        __syncthreads();
-        for (int s = nthreads / 2; s > 0; s >>= 1) {
-            if (tid < s) workspace[tid] += workspace[tid + s];
-            __syncthreads();
+    // Parallel inverse FWHT
+    for (int i = 0; i < dpt; i++) q_rot[d0 + i] = mv[i];
+    __syncthreads();
+    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= signs2[d];
+    __syncthreads();
+    for (int stride = 1; stride <= 2; stride <<= 1) {
+        for (int base = tid; base < head_dim / 2; base += nthreads) {
+            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
+            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
         }
-        if (tid == 0) q_rotated[d] = workspace[0];
+    }
+    __syncthreads();
+    for (int stride = 4; stride < head_dim; stride <<= 1) {
+        for (int base = tid; base < head_dim / 2; base += nthreads) {
+            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
+            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
+        }
         __syncthreads();
     }
-
-    if (tid == 0) fwht_inverse_128(q_rotated, signs1, signs2);
+    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= inv_sqrt * signs1[d];
     __syncthreads();
 
-    // Write output
-    float* out_head = out + h * head_dim;
-    for (int d = tid; d < head_dim; d += nthreads)
-        out_head[d] = q_rotated[d];
+    float* oh = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) oh[d] = q_rot[d];
 }
 "#;
 
