@@ -2389,4 +2389,180 @@ impl Gpu {
         let grid = ((n_channels as u32) + block - 1) / block;
         unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TurboQuant KV cache kernels
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Compile a turbo kernel by prepending the shared preamble (FWHT + centroids).
+    fn ensure_turbo_kernel(&mut self, name: &str, body_src: &str, func_name: &str) -> HipResult<()> {
+        if self.functions.contains_key(func_name) {
+            return Ok(());
+        }
+        let full_src = format!("{}\n{}", kernels::TURBO_COMMON_SRC, body_src);
+        let obj_path = self.compiler.compile(name, &full_src)?;
+        let obj_path_str = obj_path.to_str().unwrap().to_string();
+        if !self.modules.contains_key(name) {
+            let module = self.hip.module_load(&obj_path_str)?;
+            self.modules.insert(name.to_string(), module);
+        }
+        let module = &self.modules[name];
+        let func = self.hip.module_get_function(module, func_name)?;
+        self.functions.insert(func_name.to_string(), func);
+        Ok(())
+    }
+
+    /// Write KV vector to turbo_hfq4 quantized cache (4-bit, 68 bytes/head for hd=128).
+    pub fn kv_cache_write_turbo4(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_turbo_kernel("kv_cache_write_turbo4", kernels::KV_CACHE_WRITE_TURBO4_SRC, "kv_cache_write_turbo4")?;
+        let func = &self.functions["kv_cache_write_turbo4"];
+        let mut dp = dst.buf.as_ptr(); let mut sp = src.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr(); let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void, &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [1, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Write KV vector to turbo_hfq3 quantized cache (3-bit, 52 bytes/head for hd=128).
+    pub fn kv_cache_write_turbo3(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_turbo_kernel("kv_cache_write_turbo3", kernels::KV_CACHE_WRITE_TURBO3_SRC, "kv_cache_write_turbo3")?;
+        let func = &self.functions["kv_cache_write_turbo3"];
+        let mut dp = dst.buf.as_ptr(); let mut sp = src.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr(); let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void, &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [1, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Write KV vector to turbo_hfq2 quantized cache (2-bit, 36 bytes/head for hd=128).
+    pub fn kv_cache_write_turbo2(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_turbo_kernel("kv_cache_write_turbo2", kernels::KV_CACHE_WRITE_TURBO2_SRC, "kv_cache_write_turbo2")?;
+        let func = &self.functions["kv_cache_write_turbo2"];
+        let mut dp = dst.buf.as_ptr(); let mut sp = src.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr(); let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void, &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [1, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with turbo_hfq4 KV cache. Includes Q pre-rotation and V output inverse-rotation.
+    pub fn attention_turbo4_kv(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_turbo_kernel("attention_turbo4_kv", kernels::ATTENTION_TURBO4_KV_SRC, "attention_turbo4_kv")?;
+        let func = &self.functions["attention_turbo4_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr(); let mut kp = k_cache.buf.as_ptr();
+        let mut vp = v_cache.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr(); let mut s2p = signs2.buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void, &mut s2p as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = 32u32;  // one wavefront
+        // shared: scores[seq_len] + workspace[32] + q_rotated[head_dim]
+        let shared_mem = ((seq_len_hint + 32 + head_dim) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with turbo_hfq3 KV cache.
+    pub fn attention_turbo3_kv(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_turbo_kernel("attention_turbo3_kv", kernels::ATTENTION_TURBO3_KV_SRC, "attention_turbo3_kv")?;
+        let func = &self.functions["attention_turbo3_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr(); let mut kp = k_cache.buf.as_ptr();
+        let mut vp = v_cache.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr(); let mut s2p = signs2.buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void, &mut s2p as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = 32u32;
+        let shared_mem = ((seq_len_hint + 32 + head_dim) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with turbo_hfq2 KV cache.
+    pub fn attention_turbo2_kv(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_turbo_kernel("attention_turbo2_kv", kernels::ATTENTION_TURBO2_KV_SRC, "attention_turbo2_kv")?;
+        let func = &self.functions["attention_turbo2_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr(); let mut kp = k_cache.buf.as_ptr();
+        let mut vp = v_cache.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr(); let mut s2p = signs2.buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void, &mut s2p as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = 32u32;
+        let shared_mem = ((seq_len_hint + 32 + head_dim) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
 }

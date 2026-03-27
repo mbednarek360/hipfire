@@ -4334,3 +4334,667 @@ extern "C" __global__ void argmax_f32(
     if (threadIdx.x == 0) result[0] = si[0];
 }
 "#;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TurboQuant KV cache: FWHT rotation + norm-corrected quantization
+// Supports turbo_hfq2 (2-bit), turbo_hfq3 (3-bit), turbo_hfq4 (4-bit)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Shared FWHT + centroid tables used by all turbo kernels.
+/// Included as a preamble in each kernel source string.
+pub const TURBO_COMMON_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// Lloyd-Max optimal centroids for N(0,1) — scaled by corrected_norm at runtime
+__constant__ float TURBO_C2[4] = {-1.510f, -0.4528f, 0.4528f, 1.510f};
+__constant__ float TURBO_C3[8] = {-2.152f, -1.344f, -0.756f, -0.245f, 0.245f, 0.756f, 1.344f, 2.152f};
+__constant__ float TURBO_C4[16] = {
+    -2.733f, -2.069f, -1.618f, -1.256f, -0.942f, -0.656f, -0.388f, -0.127f,
+     0.127f,  0.388f,  0.656f,  0.942f,  1.256f,  1.618f,  2.069f,  2.733f
+};
+
+// In-place FWHT on 128 elements in registers.
+// signs1/signs2 are ±1.0f arrays in global memory (uploaded once).
+__device__ void fwht_forward_128(float* x,
+    const float* __restrict__ signs1, const float* __restrict__ signs2)
+{
+    // Step 1: apply signs1
+    for (int i = 0; i < 128; i++) x[i] *= signs1[i];
+
+    // Step 2: Walsh-Hadamard butterfly (7 passes for n=128)
+    for (int stride = 1; stride < 128; stride <<= 1) {
+        for (int i = 0; i < 128; i += stride * 2) {
+            for (int j = 0; j < stride; j++) {
+                float a = x[i + j];
+                float b = x[i + j + stride];
+                x[i + j]          = a + b;
+                x[i + j + stride] = a - b;
+            }
+        }
+    }
+
+    // Step 3: scale by 1/sqrt(128)
+    const float inv_sqrt_128 = 0.08838834764831845f; // 1/sqrt(128)
+    for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_128;
+
+    // Step 4: apply signs2
+    for (int i = 0; i < 128; i++) x[i] *= signs2[i];
+}
+
+// Inverse FWHT: signs2 -> butterfly -> scale -> signs1 (reverse order)
+__device__ void fwht_inverse_128(float* x,
+    const float* __restrict__ signs1, const float* __restrict__ signs2)
+{
+    for (int i = 0; i < 128; i++) x[i] *= signs2[i];
+    for (int stride = 1; stride < 128; stride <<= 1) {
+        for (int i = 0; i < 128; i += stride * 2) {
+            for (int j = 0; j < stride; j++) {
+                float a = x[i + j];
+                float b = x[i + j + stride];
+                x[i + j]          = a + b;
+                x[i + j + stride] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_128 = 0.08838834764831845f;
+    for (int i = 0; i < 128; i++) x[i] *= inv_sqrt_128 * signs1[i];
+}
+
+// Branchless 2-bit quantize: returns index 0-3
+__device__ int turbo_quantize_2bit(float x) {
+    // Thresholds: -0.9814, 0.0, 0.9814
+    return (x > -0.9814f) + (x > 0.0f) + (x > 0.9814f);
+}
+
+// Branchless 3-bit quantize: returns index 0-7
+__device__ int turbo_quantize_3bit(float x) {
+    return (x > -1.748f) + (x > -1.050f) + (x > -0.5005f) + (x > 0.0f)
+         + (x > 0.5005f) + (x > 1.050f) + (x > 1.748f);
+}
+
+// Branchless 4-bit quantize: returns index 0-15
+__device__ int turbo_quantize_4bit(float x) {
+    return (x > -2.401f) + (x > -1.8435f) + (x > -1.437f) + (x > -1.099f)
+         + (x > -0.799f) + (x > -0.522f) + (x > -0.2575f) + (x > 0.0f)
+         + (x > 0.2575f) + (x > 0.522f) + (x > 0.799f) + (x > 1.099f)
+         + (x > 1.437f) + (x > 1.8435f) + (x > 2.401f);
+}
+"#;
+
+/// KV cache write kernel for turbo_hfq4 (4-bit).
+/// Layout per head: [f32 norm (4B)][nibbles × head_dim/2 (64B)] = 68 bytes for head_dim=128.
+/// One block per kv_head, thread 0 does all work (head_dim=128 is serial per head).
+pub const KV_CACHE_WRITE_TURBO4_SRC: &str = r#"
+// turbo_common preamble is prepended by the compiler
+
+extern "C" __global__ void kv_cache_write_turbo4(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    if (threadIdx.x != 0) return;  // single thread per head
+
+    const int pos = pos_buf[0];
+    const float* head_src = src + h * head_dim;
+    const int bytes_per_head = 4 + head_dim / 2;  // f32 norm + nibbles
+    const int bytes_per_pos = n_kv_heads * bytes_per_head;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+
+    float x[128];
+
+    // Load and compute L2 norm
+    float norm_sq = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+        x[i] = head_src[i];
+        norm_sq += x[i] * x[i];
+    }
+    float orig_norm = sqrtf(norm_sq);
+    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
+
+    // Normalize
+    for (int i = 0; i < head_dim; i++) x[i] *= inv_norm;
+
+    // FWHT rotate
+    fwht_forward_128(x, signs1, signs2);
+
+    // Quantize to 4-bit and compute reconstruction norm
+    unsigned char indices[128];
+    float recon_sq = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+        int idx = turbo_quantize_4bit(x[i]);
+        indices[i] = (unsigned char)idx;
+        float c = TURBO_C4[idx];
+        recon_sq += c * c;
+    }
+
+    // Corrected norm: guarantees exact L2 norm preservation
+    float recon_norm = sqrtf(recon_sq);
+    float corrected_norm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
+
+    // Write: [f32 corrected_norm][nibbles]
+    *(float*)out = corrected_norm;
+    for (int i = 0; i < head_dim; i += 2) {
+        out[4 + i/2] = (indices[i] & 0xF) | (indices[i+1] << 4);
+    }
+}
+"#;
+
+/// KV cache write kernel for turbo_hfq3 (3-bit, split 2+1).
+/// Layout per head: [f32 norm (4B)][2-bit low × hd/4 (32B)][1-bit high × hd/8 (16B)] = 52 bytes.
+pub const KV_CACHE_WRITE_TURBO3_SRC: &str = r#"
+extern "C" __global__ void kv_cache_write_turbo3(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    if (threadIdx.x != 0) return;
+
+    const int pos = pos_buf[0];
+    const float* head_src = src + h * head_dim;
+    const int qs_bytes = head_dim / 4;     // 2-bit packed: 4 per byte
+    const int sign_bytes = head_dim / 8;   // 1-bit packed: 8 per byte
+    const int bytes_per_head = 4 + qs_bytes + sign_bytes;
+    const int bytes_per_pos = n_kv_heads * bytes_per_head;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+
+    float x[128];
+    float norm_sq = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+        x[i] = head_src[i];
+        norm_sq += x[i] * x[i];
+    }
+    float orig_norm = sqrtf(norm_sq);
+    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
+    for (int i = 0; i < head_dim; i++) x[i] *= inv_norm;
+    fwht_forward_128(x, signs1, signs2);
+
+    // Quantize to 3-bit, pack split 2+1
+    unsigned char qs[32] = {0};    // 2-bit low (4 per byte)
+    unsigned char hi[16] = {0};    // 1-bit high (8 per byte)
+    float recon_sq = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+        int idx = turbo_quantize_3bit(x[i]);
+        float c = TURBO_C3[idx];
+        recon_sq += c * c;
+        qs[i / 4] |= ((idx & 0x3) << ((i % 4) * 2));
+        hi[i / 8] |= (((idx >> 2) & 0x1) << (i % 8));
+    }
+
+    float recon_norm = sqrtf(recon_sq);
+    float corrected_norm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
+
+    *(float*)out = corrected_norm;
+    for (int i = 0; i < qs_bytes; i++) out[4 + i] = qs[i];
+    for (int i = 0; i < sign_bytes; i++) out[4 + qs_bytes + i] = hi[i];
+}
+"#;
+
+/// KV cache write kernel for turbo_hfq2 (2-bit).
+/// Layout per head: [f32 norm (4B)][2-bit × hd/4 (32B)] = 36 bytes for head_dim=128.
+pub const KV_CACHE_WRITE_TURBO2_SRC: &str = r#"
+extern "C" __global__ void kv_cache_write_turbo2(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    if (threadIdx.x != 0) return;
+
+    const int pos = pos_buf[0];
+    const float* head_src = src + h * head_dim;
+    const int qs_bytes = head_dim / 4;  // 2-bit: 4 per byte
+    const int bytes_per_head = 4 + qs_bytes;
+    const int bytes_per_pos = n_kv_heads * bytes_per_head;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+
+    float x[128];
+    float norm_sq = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+        x[i] = head_src[i];
+        norm_sq += x[i] * x[i];
+    }
+    float orig_norm = sqrtf(norm_sq);
+    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
+    for (int i = 0; i < head_dim; i++) x[i] *= inv_norm;
+    fwht_forward_128(x, signs1, signs2);
+
+    unsigned char qs[32] = {0};
+    float recon_sq = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+        int idx = turbo_quantize_2bit(x[i]);
+        float c = TURBO_C2[idx];
+        recon_sq += c * c;
+        qs[i / 4] |= ((idx & 0x3) << ((i % 4) * 2));
+    }
+
+    float recon_norm = sqrtf(recon_sq);
+    float corrected_norm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
+
+    *(float*)out = corrected_norm;
+    for (int i = 0; i < qs_bytes; i++) out[4 + i] = qs[i];
+}
+"#;
+
+/// Attention kernel with turbo_hfq4 KV cache (4-bit, nibble-packed).
+/// One wavefront (32 threads) per attention head.
+/// Q is pre-rotated in shared memory, V output is inverse-rotated.
+pub const ATTENTION_TURBO4_KV_SRC: &str = r#"
+extern "C" __global__ void attention_turbo4_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int bytes_per_head = 4 + head_dim / 2;  // 68 for hd=128
+    const int bytes_per_pos = n_kv_heads * bytes_per_head;
+    const int kv_head_off = kv_h * bytes_per_head;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+    float* q_rotated = workspace + nthreads;  // head_dim floats
+
+    // Load Q into shared memory and rotate
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_rotated[d] = q[h * head_dim + d];
+    __syncthreads();
+    if (tid == 0) fwht_forward_128(q_rotated, signs1, signs2);
+    __syncthreads();
+
+    // Phase 1: Q_rotated @ K_turbo^T
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* kb = k_cache + (size_t)t * bytes_per_pos + kv_head_off;
+        float cnorm = *(const float*)kb;
+
+        // Build centroid LUT scaled by corrected norm
+        float cn[16];
+        for (int c = 0; c < 16; c++) cn[c] = TURBO_C4[c] * cnorm;
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d += 2) {
+            unsigned char packed = kb[4 + d/2];
+            dot += cn[packed & 0xF] * q_rotated[d];
+            dot += cn[packed >> 4]  * q_rotated[d + 1];
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    // Reduce max
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    // Softmax exp + sum
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+    for (int t = tid; t < seq_len; t += nthreads)
+        scores[t] /= sum_val;
+    __syncthreads();
+
+    // Phase 2: weighted V sum (in rotated space)
+    float out_rotated[128];
+    for (int d = 0; d < head_dim; d++) out_rotated[d] = 0.0f;
+
+    // Each thread processes a chunk of positions
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float w = scores[t];
+        if (w < 1e-8f) continue;
+        const unsigned char* vb = v_cache + (size_t)t * bytes_per_pos + kv_head_off;
+        float cnorm_v = *(const float*)vb;
+        for (int d = 0; d < head_dim; d += 2) {
+            unsigned char packed = vb[4 + d/2];
+            out_rotated[d]     += w * TURBO_C4[packed & 0xF] * cnorm_v;
+            out_rotated[d + 1] += w * TURBO_C4[packed >> 4]  * cnorm_v;
+        }
+    }
+
+    // Reduce across threads: sum out_rotated via shared memory
+    // Thread-local partial sums need to be combined
+    float* shared_out = workspace;  // reuse workspace (need head_dim floats)
+    for (int d = 0; d < head_dim; d++) {
+        workspace[tid] = out_rotated[d];
+        __syncthreads();
+        for (int s = nthreads / 2; s > 0; s >>= 1) {
+            if (tid < s) workspace[tid] += workspace[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) shared_out[d] = workspace[0];  // temporarily store in low slots
+        __syncthreads();
+    }
+
+    // Copy reduced output to q_rotated (reuse that shared mem) then inverse FWHT
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_rotated[d] = shared_out[d];
+    __syncthreads();
+
+    if (tid == 0) fwht_inverse_128(q_rotated, signs1, signs2);
+    __syncthreads();
+
+    // Write output
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads)
+        out_head[d] = q_rotated[d];
+}
+"#;
+
+/// Attention kernel with turbo_hfq3 KV cache (3-bit, split 2+1).
+pub const ATTENTION_TURBO3_KV_SRC: &str = r#"
+extern "C" __global__ void attention_turbo3_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int qs_bytes = head_dim / 4;
+    const int sign_bytes = head_dim / 8;
+    const int bytes_per_head = 4 + qs_bytes + sign_bytes;  // 52 for hd=128
+    const int bytes_per_pos = n_kv_heads * bytes_per_head;
+    const int kv_head_off = kv_h * bytes_per_head;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+    float* q_rotated = workspace + nthreads;
+
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_rotated[d] = q[h * head_dim + d];
+    __syncthreads();
+    if (tid == 0) fwht_forward_128(q_rotated, signs1, signs2);
+    __syncthreads();
+
+    // Phase 1: Q_rotated @ K_turbo3^T
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* kb = k_cache + (size_t)t * bytes_per_pos + kv_head_off;
+        float cnorm = *(const float*)kb;
+        const unsigned char* qs = kb + 4;
+        const unsigned char* hi = kb + 4 + qs_bytes;
+
+        float cn[8];
+        for (int c = 0; c < 8; c++) cn[c] = TURBO_C3[c] * cnorm;
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            int low2 = (qs[d / 4] >> ((d % 4) * 2)) & 0x3;
+            int hi1  = (hi[d / 8] >> (d % 8)) & 0x1;
+            int idx  = low2 | (hi1 << 2);
+            dot += cn[idx] * q_rotated[d];
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+    for (int t = tid; t < seq_len; t += nthreads)
+        scores[t] /= sum_val;
+    __syncthreads();
+
+    // Phase 2: weighted V sum
+    float out_rotated[128];
+    for (int d = 0; d < head_dim; d++) out_rotated[d] = 0.0f;
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float w = scores[t];
+        if (w < 1e-8f) continue;
+        const unsigned char* vb = v_cache + (size_t)t * bytes_per_pos + kv_head_off;
+        float cnorm_v = *(const float*)vb;
+        const unsigned char* qs = vb + 4;
+        const unsigned char* hi = vb + 4 + qs_bytes;
+        for (int d = 0; d < head_dim; d++) {
+            int low2 = (qs[d / 4] >> ((d % 4) * 2)) & 0x3;
+            int hi1  = (hi[d / 8] >> (d % 8)) & 0x1;
+            int idx  = low2 | (hi1 << 2);
+            out_rotated[d] += w * TURBO_C3[idx] * cnorm_v;
+        }
+    }
+
+    float* shared_out = workspace;
+    for (int d = 0; d < head_dim; d++) {
+        workspace[tid] = out_rotated[d];
+        __syncthreads();
+        for (int s = nthreads / 2; s > 0; s >>= 1) {
+            if (tid < s) workspace[tid] += workspace[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) shared_out[d] = workspace[0];
+        __syncthreads();
+    }
+
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_rotated[d] = shared_out[d];
+    __syncthreads();
+    if (tid == 0) fwht_inverse_128(q_rotated, signs1, signs2);
+    __syncthreads();
+
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads)
+        out_head[d] = q_rotated[d];
+}
+"#;
+
+/// Attention kernel with turbo_hfq2 KV cache (2-bit).
+pub const ATTENTION_TURBO2_KV_SRC: &str = r#"
+extern "C" __global__ void attention_turbo2_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int qs_bytes = head_dim / 4;
+    const int bytes_per_head = 4 + qs_bytes;  // 36 for hd=128
+    const int bytes_per_pos = n_kv_heads * bytes_per_head;
+    const int kv_head_off = kv_h * bytes_per_head;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+    float* q_rotated = workspace + nthreads;
+
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_rotated[d] = q[h * head_dim + d];
+    __syncthreads();
+    if (tid == 0) fwht_forward_128(q_rotated, signs1, signs2);
+    __syncthreads();
+
+    // Phase 1: Q_rotated @ K_turbo2^T
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* kb = k_cache + (size_t)t * bytes_per_pos + kv_head_off;
+        float cnorm = *(const float*)kb;
+
+        float cn[4];
+        for (int c = 0; c < 4; c++) cn[c] = TURBO_C2[c] * cnorm;
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d += 4) {
+            unsigned char packed = kb[4 + d/4];
+            dot += cn[(packed)      & 0x3] * q_rotated[d];
+            dot += cn[(packed >> 2) & 0x3] * q_rotated[d + 1];
+            dot += cn[(packed >> 4) & 0x3] * q_rotated[d + 2];
+            dot += cn[(packed >> 6) & 0x3] * q_rotated[d + 3];
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+    for (int t = tid; t < seq_len; t += nthreads)
+        scores[t] /= sum_val;
+    __syncthreads();
+
+    // Phase 2: weighted V sum
+    float out_rotated[128];
+    for (int d = 0; d < head_dim; d++) out_rotated[d] = 0.0f;
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float w = scores[t];
+        if (w < 1e-8f) continue;
+        const unsigned char* vb = v_cache + (size_t)t * bytes_per_pos + kv_head_off;
+        float cnorm_v = *(const float*)vb;
+        for (int d = 0; d < head_dim; d += 4) {
+            unsigned char packed = vb[4 + d/4];
+            out_rotated[d]     += w * TURBO_C2[(packed)      & 0x3] * cnorm_v;
+            out_rotated[d + 1] += w * TURBO_C2[(packed >> 2) & 0x3] * cnorm_v;
+            out_rotated[d + 2] += w * TURBO_C2[(packed >> 4) & 0x3] * cnorm_v;
+            out_rotated[d + 3] += w * TURBO_C2[(packed >> 6) & 0x3] * cnorm_v;
+        }
+    }
+
+    float* shared_out = workspace;
+    for (int d = 0; d < head_dim; d++) {
+        workspace[tid] = out_rotated[d];
+        __syncthreads();
+        for (int s = nthreads / 2; s > 0; s >>= 1) {
+            if (tid < s) workspace[tid] += workspace[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) shared_out[d] = workspace[0];
+        __syncthreads();
+    }
+
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_rotated[d] = shared_out[d];
+    __syncthreads();
+    if (tid == 0) fwht_inverse_128(q_rotated, signs1, signs2);
+    __syncthreads();
+
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads)
+        out_head[d] = q_rotated[d];
+}
+"#;
