@@ -4728,36 +4728,19 @@ extern "C" __global__ void kv_cache_write_turbo4(
         for (int d = tid; d < head_dim; d += nthreads) x[d] *= inv_norm;
         __syncthreads();
 
-        // Parallel FWHT
-        for (int d = tid; d < head_dim; d += nthreads) x[d] *= signs1[d];
-        __syncthreads();
-        for (int stride = 1; stride <= 2; stride <<= 1) {
-            for (int base = tid; base < head_dim / 2; base += nthreads) {
-                int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-                float a = x[i], b = x[i + stride]; x[i] = a + b; x[i + stride] = a - b;
-            }
-        }
-        __syncthreads();
-        for (int stride = 4; stride < head_dim; stride <<= 1) {
-            for (int base = tid; base < head_dim / 2; base += nthreads) {
-                int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-                float a = x[i], b = x[i + stride]; x[i] = a + b; x[i + stride] = a - b;
-            }
-            __syncthreads();
-        }
-        const float inv_sqrt = 0.08838834764831845f;
-        for (int d = tid; d < head_dim; d += nthreads) x[d] *= inv_sqrt * signs2[d];
-        __syncthreads();
-
-        // 4-bit quantize (each thread handles 4 dims = 2 nibble bytes)
+        // Register-only FWHT via __shfl_xor
         const int dpt = head_dim / nthreads;
         const int d0 = tid * dpt;
+        float fa = x[d0], fb = x[d0+1], fc = x[d0+2], fd = x[d0+3];
+        fwht_shfl_forward(fa, fb, fc, fd, signs1, signs2, tid);
+
+        // 4-bit quantize from registers
         float local_rsq = 0.0f;
         int idx0, idx1, idx2, idx3;
-        idx0 = turbo_quantize_4bit(x[d0]);     local_rsq += TURBO_C4[idx0] * TURBO_C4[idx0];
-        idx1 = turbo_quantize_4bit(x[d0 + 1]); local_rsq += TURBO_C4[idx1] * TURBO_C4[idx1];
-        idx2 = turbo_quantize_4bit(x[d0 + 2]); local_rsq += TURBO_C4[idx2] * TURBO_C4[idx2];
-        idx3 = turbo_quantize_4bit(x[d0 + 3]); local_rsq += TURBO_C4[idx3] * TURBO_C4[idx3];
+        idx0 = turbo_quantize_4bit(fa);     local_rsq += TURBO_C4[idx0] * TURBO_C4[idx0];
+        idx1 = turbo_quantize_4bit(fb); local_rsq += TURBO_C4[idx1] * TURBO_C4[idx1];
+        idx2 = turbo_quantize_4bit(fc); local_rsq += TURBO_C4[idx2] * TURBO_C4[idx2];
+        idx3 = turbo_quantize_4bit(fd); local_rsq += TURBO_C4[idx3] * TURBO_C4[idx3];
 
         scratch[tid] = local_rsq;
         __syncthreads();
@@ -5023,34 +5006,15 @@ extern "C" __global__ void attention_turbo4_kv(
     const int dpt = head_dim / nthreads;  // 4
     const int d0 = tid * dpt;
 
-    float* scores = sdata;
-    float* q_rot = sdata + seq_len;
+    float* scores = sdata;  // only scores in shared memory
 
-    // Parallel FWHT on Q
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] = q[h * head_dim + d];
-    __syncthreads();
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= signs1[d];
-    __syncthreads();
-    for (int stride = 1; stride <= 2; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-    }
-    __syncthreads();
-    for (int stride = 4; stride < head_dim; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-        __syncthreads();
-    }
-    const float inv_sqrt = 0.08838834764831845f;
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= inv_sqrt * signs2[d];
-    __syncthreads();
-
-    float mq[4];
-    for (int i = 0; i < dpt; i++) mq[i] = q_rot[d0 + i];
+    // Register-only FWHT on Q
+    float mq0 = q[h * head_dim + d0];
+    float mq1 = q[h * head_dim + d0 + 1];
+    float mq2 = q[h * head_dim + d0 + 2];
+    float mq3 = q[h * head_dim + d0 + 3];
+    fwht_shfl_forward(mq0, mq1, mq2, mq3, signs1, signs2, tid);
+    float mq[4] = {mq0, mq1, mq2, mq3};
 
     // K dot: each thread reads 2 nibble bytes (4 dims), warp-shuffle reduce
     for (int t = 0; t < seq_len; t++) {
@@ -5098,30 +5062,11 @@ extern "C" __global__ void attention_turbo4_kv(
         mv[3] += wn * TURBO_C4[b1 >> 4];
     }
 
-    // Parallel inverse FWHT
-    for (int i = 0; i < dpt; i++) q_rot[d0 + i] = mv[i];
-    __syncthreads();
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= signs2[d];
-    __syncthreads();
-    for (int stride = 1; stride <= 2; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-    }
-    __syncthreads();
-    for (int stride = 4; stride < head_dim; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-        __syncthreads();
-    }
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= inv_sqrt * signs1[d];
-    __syncthreads();
+    // Register-only inverse FWHT
+    fwht_shfl_inverse(mv[0], mv[1], mv[2], mv[3], signs1, signs2, tid);
 
     float* oh = out + h * head_dim;
-    for (int d = tid; d < head_dim; d += nthreads) oh[d] = q_rot[d];
+    oh[d0] = mv[0]; oh[d0+1] = mv[1]; oh[d0+2] = mv[2]; oh[d0+3] = mv[3];
 }
 "#;
 
