@@ -26,47 +26,17 @@
         rocm = pkgs.rocmPackages;
         clr = rocm.clr;
 
-        # ─── Shell scripts as Nix derivations ─────────────────────
-        # Using pkgs.writeShellScriptBin with ''...'' (raw strings)
-        # avoids all ${} escaping issues — bash variables stay literal.
-
-       # Absolute path to the CLI directory (known at build time).
-        hipfireCliDir = "${hipfire-bin}/share/hipfire-cli";
-
-        # The hipfire CLI wrapper script with hardcoded bun and CLI dir paths.
-        hipfireCliWrapper = pkgs.writeTextFile {
-          name = "hipfire";
-          executable = true;
-          destination = "/bin/hipfire";
-          text = ''
-            #!/bin/bash
-            set +u
-            set -e
-            BUN="${pkgs.bun}/bin/bun"
-            if [ ! -x "$BUN" ]; then
-              echo "hipfire: bun not found at $BUN" >&2
-              exit 127
-            fi
-            CLI_DIR="${hipfireCliDir}"
-            if [ ! -f "$CLI_DIR/index.ts" ]; then
-              echo "hipfire: CLI not found at $CLI_DIR" >&2
-              exit 127
-            fi
-            exec "$BUN" run "$CLI_DIR/index.ts" "$@"
-          '';
-        };
-
         # Kernel pre-compilation helper.
         # Searches for pre-built .hsaco blobs and copies them to
         # ~/.hipfire/bin/kernels/<arch>/ for the daemon to load.
         hipfireKernels = pkgs.writeShellApplication {
-          name = "hipfire-kernels";
-          runtimeInputs = [ pkgs.gnugrep ];
-         text = ''
-            set +u
-            set -e
-            export HIPFIRE_DIR="$HOME/.hipfire"
-            export HIPFIRE_BIN="${placeholder "out"}/bin"
+           name = "hipfire-kernels";
+           runtimeInputs = [ pkgs.gnugrep ];
+           text = ''
+             set +u
+             set -e
+             export HIPFIRE_DIR="${placeholder "out"}/share/hipfire"
+             export HIPFIRE_BIN="$HIPFIRE_DIR/bin"
             KERNEL_LIST=""
 
             # Collect available pre-compiled kernel sets from known paths.
@@ -172,29 +142,60 @@
           '';
 
           installPhase = ''
-              mkdir -p $out/bin
-              # Copy all engine examples (only actual binaries, not .d/.o/hash files).
+              mkdir -p $out/bin $out/share/hipfire/bin
+
+              # Copy all engine examples + hipfire-quantize into share/hipfire/bin/.
               for f in target/release/examples/*; do
                 [ -f "$f" ] || continue
-                case "$f" in
-                  *.d|*.o) continue ;;
-                esac
-                basename_f=$(basename "$f")
-                # Skip cargo fingerprinted copies (e.g., daemon-f9993d38fd088eb6).
-                case "$basename_f" in
+                case "$f" in *.d|*.o) continue ;; esac
+                case "$(basename "$f")" in
                   *-*[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) continue ;;
                 esac
-                cp "$f" $out/bin/
+                cp "$f" $out/share/hipfire/bin/
               done
-              # Copy hipfire-quantize binary.
-              cp target/release/hipfire-quantize $out/bin/ 2>/dev/null || true
+              cp target/release/hipfire-quantize $out/share/hipfire/bin/ 2>/dev/null || true
 
               # Bundle the CLI TypeScript app.
-              mkdir -p $out/share/hipfire-cli
-              cp -r cli/* $out/share/hipfire-cli/
+              mkdir -p $out/share/hipfire/cli
+              cp -r cli/* $out/share/hipfire/cli/
 
-              # Install the kernel helper.
-              cp ${hipfireKernels}/bin/hipfire-kernels $out/bin/hipfire-kernels
+              # Kernel pre-compilation helper.
+              cp ${hipfireKernels}/bin/hipfire-kernels $out/share/hipfire/bin/
+
+              # Wrap every binary to ensure ROCm libs are discoverable.
+              for bin in $out/share/hipfire/bin/*; do
+                [ -f "$bin" ] || continue
+                [ -x "$bin" ] || continue
+                case "$(file -b "$bin")" in
+                  *script*text*) continue ;;
+                esac
+                wrapProgram "$bin" \
+                  --prefix LD_LIBRARY_PATH : "${rocm.rocm-runtime}/lib:${rocm.rocm-core}/lib" \
+                  --prefix PATH : "${rocm.rocm-core}/bin" \
+                  --set HIP_PATH "${clr}" \
+                  --set HIP_PLATFORM amd \
+                  --set ROCM_PATH "${clr}" \
+                  --set HSA_PATH "${clr}"
+              done
+
+              # Install the hipfire CLI wrapper to $out/bin/hipfire.
+              cat > $out/bin/hipfire << 'WRAPPER'
+                #!/bin/bash
+                set +u
+                set -e
+                BUN="${pkgs.bun}/bin/bun"
+                if [ ! -x "$BUN" ]; then
+                  echo "hipfire: bun not found at $BUN" >&2
+                  exit 127
+                fi
+                HIPFIRE_DIR="${placeholder "out"}/share/hipfire"
+                if [ ! -f "$HIPFIRE_DIR/bin/daemon" ]; then
+                  echo "hipfire: daemon not found at $HIPFIRE_DIR/bin/daemon" >&2
+                  exit 127
+                fi
+                exec "$BUN" run "$HIPFIRE_DIR/cli/index.ts" "$@"
+              WRAPPER
+              chmod +x $out/bin/hipfire
           '';
 
           meta = with pkgs.lib; {
@@ -204,40 +205,6 @@
             platforms = platforms.linux;
             maintainers = [ ];
           };
-        };
-
-        # Self-contained package with ROCm-wrapped binaries + CLI bundled.
-        hipfire = pkgs.stdenvNoCC.mkDerivation {
-          name = "hipfire";
-          src = hipfire-bin;
-
-          nativeBuildInputs = [ pkgs.makeWrapper pkgs.bun ];
-
-installPhase = ''
-            mkdir -p $out/bin $out/share
-            cp -r ${hipfire-bin}/bin/* $out/bin/
-            cp -r ${hipfire-bin}/share/* $out/share/
-
-            # Install the hipfire CLI wrapper with hardcoded CLI dir path.
-            cp ${hipfireCliWrapper}/bin/hipfire $out/bin/hipfire
-
-            # Wrap every binary to ensure ROCm libs are discoverable.
-            for bin in $out/bin/*; do
-              [ -f "$bin" ] || continue
-              [ -x "$bin" ] || continue
-              # Skip directories (kernels/compiled) and scripts that already have shebangs.
-              case "$(file -b "$bin")" in
-                *script*text*) continue ;;
-              esac
-              wrapProgram "$bin" \
-               --prefix LD_LIBRARY_PATH : "${rocm.rocm-runtime}/lib:${rocm.rocm-core}/lib" \
-               --prefix PATH : "${rocm.rocm-core}/bin" \
-               --set HIP_PATH "${clr}" \
-               --set HIP_PLATFORM amd \
-               --set ROCM_PATH "${clr}" \
-               --set HSA_PATH "${clr}"
-            done
-          '';
         };
 
         # Development shell with all build dependencies.
@@ -292,15 +259,15 @@ installPhase = ''
       in
       {
         packages = rec {
-          default = hipfire;
-          inherit hipfire hipfire-bin;
+          default = hipfire-bin;
+          inherit hipfire-bin;
         };
 
         apps.default = flake-utils.lib.mkApp {
-          drv = hipfire;
+          drv = hipfire-bin;
         };
 
         devShells.default = devShell;
       }
     );
-}    
+} 
