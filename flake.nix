@@ -124,6 +124,7 @@
           # Pass ROCm paths so hipcc is found during kernel JIT / precompile.
           nativeBuildInputs = [
             pkgs.makeWrapper
+            pkgs.patchelf
             rocm.rocm-core
           ];
 
@@ -168,6 +169,7 @@
               cp ${hipfireKernels}/bin/hipfire-kernels $out/share/hipfire/bin/
 
               # Wrap every binary to ensure ROCm libs are discoverable.
+              # wrapProgram sets LD_LIBRARY_PATH but dlopen() needs rpath too.
               for bin in $out/share/hipfire/bin/*; do
                 [ -f "$bin" ] || continue
                 [ -x "$bin" ] || continue
@@ -175,12 +177,13 @@
                   *script*text*) continue ;;
                 esac
                 wrapProgram "$bin" \
-                  --prefix LD_LIBRARY_PATH : "${rocm.rocm-runtime}/lib:${rocm.rocm-core}/lib" \
-                  --prefix PATH : "${rocm.rocm-core}/bin" \
+                  --prefix LD_LIBRARY_PATH : "${clr}/lib" \
+                  --prefix PATH : "${clr}/bin" \
                   --set HIP_PATH "${clr}" \
                   --set HIP_PLATFORM amd \
                   --set ROCM_PATH "${clr}" \
                   --set HSA_PATH "${clr}"
+                patchelf --set-rpath "${clr}/lib:$out/share/hipfire/bin" "$bin" 2>/dev/null || true
               done
 
               # Install the hipfire CLI wrapper to $out/bin/hipfire.
@@ -275,4 +278,4 @@
         devShells.default = devShell;
       }
     );
-} 
+}  
