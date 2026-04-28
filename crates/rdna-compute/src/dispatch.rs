@@ -102,19 +102,6 @@ fn has_mmq_i8_wmma(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151")
 }
 
-/// Whether to use the MMQ (i8 WMMA) prefill path for this arch + batch size.
-/// HIPFIRE_MMQ=1 forces MMQ at any batch size. HIPFIRE_MMQ=0 disables it.
-/// Otherwise, auto-enable for gfx1150/gfx1151 at batch_size >= 128 where MMQ
-/// consistently outperforms fp16 WMMA (886 vs 543 tok/s on 9B pp128, gfx1151).
-fn use_mmq_prefill(arch: &str, batch_size: usize) -> bool {
-    if !has_mmq_i8_wmma(arch) { return false; }
-    match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
-        Some("1") => true,
-        Some("0") => false,
-        _ => matches!(arch, "gfx1150" | "gfx1151") && batch_size >= 128,
-    }
-}
-
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
     pub buf: DeviceBuffer,
@@ -2469,7 +2456,7 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if use_mmq_prefill(&self.arch, batch_size) {
+            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
                 let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
                 let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
                 let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size) } else { Ok(()) };
@@ -2763,7 +2750,7 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if use_mmq_prefill(&self.arch, batch_size) {
+            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
                 let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
                 let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_q, xq, y_q, q_m, k, batch_size);
                 let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_k, xq, y_k, k_m, k, batch_size) } else { Ok(()) };
@@ -3037,7 +3024,7 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            if use_mmq_prefill(&self.arch, batch_size) {
+            if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
                 let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
                 let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_gate, xq, y_gate, gate_m, k, batch_size);
                 let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_up, xq, y_up, up_m, k, batch_size) } else { Ok(()) };
@@ -4569,12 +4556,12 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            // MMQ path (RDNA3/3.5): Q8_1 activation quantize + i8 WMMA.
-            // Auto-enabled for gfx1150/1151 at batch_size≥128; opt-in elsewhere
-            // via HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1. See PR #73 / issue #60.
-            if use_mmq_prefill(&self.arch, batch_size)
-                || (std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
-                    && has_mmq_i8_wmma(&self.arch))
+            // Opt-in MMQ path (RDNA3/3.5, HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
+            // Q8_1 activation quantize + i8 WMMA. ~+20% on pp≥256, larger on
+            // Strix Halo. Experimental — see PR #73 / issue #60.
+            if (std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
+                || std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1"))
+                && has_mmq_i8_wmma(&self.arch)
             {
                 return self.gemm_hfq4g256_residual_mmq(a_raw, x, y, m, k, batch_size);
             }
@@ -4953,12 +4940,17 @@ impl Gpu {
         //   ksplit — K-split + atomicAdd (non-deterministic accum order)
         //   k2     — 2× K-tile pipeline (byte-exact accum order)
         //   k2x32  — 32-row block with shared X fragment per K-tile. Slower
-        //            than k2 on gfx1100, but faster on gfx1151 Strix Halo
-        //            for Qwen3.5 9B prefill (pp2048 q8: 339.7 → 351.3 tok/s).
+        //            than k2 on gfx1100, but faster on gfx1151 Strix Halo for
+        //            small-M residual projections at prefill-sized batches.
+        //            DFlash verify/lm_head runs at B<=16 and large-M draft
+        //            FFN/lm_head also prefer k2.
         //   k4     — 4× K-tile pipeline (output-mapping bug, τ=0 on dflash — debug only)
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
-        let auto_variant = if matches!(self.arch.as_str(), "gfx1150" | "gfx1151") {
+        let is_gfx115x = matches!(self.arch.as_str(), "gfx1150" | "gfx1151");
+        let auto_variant = if is_gfx115x && batch_size <= 16 {
+            "k2"
+        } else if is_gfx115x && m < 8192 {
             "k2x32"
         } else if m >= 8192 {
             "k2"

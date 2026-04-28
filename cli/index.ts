@@ -354,6 +354,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       console.error(`[hipfire] DFlash disabled (dflash_mode=off).`);
     }
   } else {
+    // Surface the #89 risk when the user explicitly opted into DFlash on an
+    // A3B target without a TriAttention sidecar. The "auto" path filters this
+    // case out silently (above), but mode === "on" is force-on and skips that
+    // gate — without this warning the user only finds out when a thinking
+    // turn loops on the last 1/3 of <think>. R̄≈0.39 is a structural ceiling
+    // (MoE routing variance); per-expert sidecars are the long-term fix.
+    if (isA3B && !hasSidecar && mode === "on") {
+      console.error(`[hipfire] WARNING: DFlash on A3B target without sidecar — known thinking-loop attractor (~20-40% rate on long greedy decode, see #89). Set dflash_mode=auto to disable, or attach a TriAttention sidecar.`);
+    }
     const explicit = process.env.HIPFIRE_DFLASH_DRAFT;
     if (explicit !== undefined) {
       if (explicit.length > 0) params.draft = explicit;
@@ -1004,10 +1013,29 @@ async function serve(port: number) {
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
+  //
+  // CRITICAL: `lastRequestTime` is only bumped when a new request *arrives*
+  // (line below in the fetch handler). It is NOT updated while a long
+  // single request is generating. So a request that legitimately runs
+  // longer than idle_timeout — e.g. a thinking-heavy A3B turn that
+  // reasons for 4-6 minutes before answering — would have the eviction
+  // timer fire mid-stream, send `unload` to the daemon while it was
+  // emitting tokens, and silently kill the active generation. Reported by
+  // @mikiadev in #79 ("engine gives up after 300s while clearly still
+  // working in btop"). The CLI's SSE heartbeat keeps the *connection*
+  // alive but can't save the dispatch from this race.
+  //
+  // Fix: also gate eviction on `e.generating` — never unload while a
+  // generation is in flight, regardless of how stale lastRequestTime
+  // looks. Once the generate completes (`e.generating = false` in the
+  // streaming finally / non-streaming completion path), the timer's
+  // next tick re-evaluates and evicts cleanly if the connection has
+  // since gone idle.
   let lastRequestTime = Date.now();
   const idleTimeoutMs = cfg.idle_timeout * 1000;
   const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
     if (!current) return;                              // nothing to unload
+    if (e.generating) return;                          // active stream — don't yank
     if (Date.now() - lastRequestTime < idleTimeoutMs) return;
     try {
       console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
@@ -1241,11 +1269,43 @@ async function serve(port: number) {
         // Fall back to the user's configured defaults (global or per-model) when
         // an OpenAI client doesn't set a field. 512 was a hardcoded surprise
         // that ignored `hipfire config set max_tokens …`.
+        // OpenAI repeat-penalty mapping: take the larger of frequency_penalty
+        // and presence_penalty when present. Both are -2..2 in the OpenAI
+        // surface; we map non-negative values to repeat_penalty = 1 + p.
+        // (Negative penalties — boosts — aren't meaningful for hipfire's
+        // multiplicative repeat_penalty kernel, so they're treated as zero.)
+        // Requested by @shilga in #79; previously only frequency_penalty was
+        // honored.
+        const oaiPenalty = Math.max(
+          0,
+          Number(body.frequency_penalty) || 0,
+          Number(body.presence_penalty) || 0,
+        );
+        const oaiPenaltySet = body.frequency_penalty != null || body.presence_penalty != null;
+
+        // chat_template_kwargs (Qwen / DeepSeek / pi-coding-agent extension).
+        // Two recognized keys, both per-request overrides on top of
+        // global / per-model config:
+        //   enable_thinking   — false forces an effective no-think turn
+        //                       (max_think_tokens=1, model still emits <think>
+        //                       but is hard-capped to one token before
+        //                       being forced to close).
+        //   preserve_thinking — true leaves <think>...</think> intact in
+        //                       message.content (non-streaming) instead of
+        //                       stripping it. Streaming still uses the
+        //                       reasoning_content channel; this flag only
+        //                       affects the final concatenated message.
+        // Requested by @shilga in #79.
+        const ctk = (body.chat_template_kwargs && typeof body.chat_template_kwargs === "object")
+          ? body.chat_template_kwargs : {};
+        const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
+        const preserveThinking: boolean = ctk.preserve_thinking === true;
+
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
-          repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : effective.repeat_penalty),
+          repeat_penalty: body.repeat_penalty ?? (oaiPenaltySet ? 1.0 + oaiPenalty : effective.repeat_penalty),
           top_p: body.top_p ?? effective.top_p,
         };
         // Mirror the `hipfire run` path's per-model max_think_tokens
@@ -1255,6 +1315,11 @@ async function serve(port: number) {
         // Reported in #74 with qwen3.6:27b returning empty content + full
         // 8192 completion_tokens despite max_think_tokens=2048 in config.
         if (effective.max_think_tokens > 0) genParams.max_think_tokens = effective.max_think_tokens;
+        // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1
+        // token (model emits <think> then is forced to close). Overrides
+        // per-model max_think_tokens because the request semantics are more
+        // specific than the static config.
+        if (enableThinking === false) genParams.max_think_tokens = 1;
         // thinking=off is currently a no-op at the CLI layer. Earlier
         // versions injected a prose system directive ("Respond directly
         // without using <think>...</think> reasoning blocks") here, but
@@ -1298,6 +1363,27 @@ async function serve(port: number) {
           const hasTool = tools.length > 0;
           return new Response(new ReadableStream({
             async start(ctrl) {
+              // Prefill heartbeat: emit an SSE comment every 10s while no
+              // visible body bytes have been sent. The daemon's
+              // `forward_prefill_batch` is one synchronous device call per
+              // chunk and emits no events until the first sampled token, so on
+              // a 27B model with a 10–30K-token agent context (CLAUDE.md /
+              // AGENTS.md / skills / tools) the connection sits silent for 1–5
+              // minutes. OpenCode (#85) and pi-coding-agent (#79) have
+              // sub-minute first-byte/idle timeouts and abort. SSE comment
+              // lines (": …\n\n") are spec-required to be ignored by clients
+              // but keep the TCP connection — and any intermediary timer —
+              // alive. The flag is gated on actually enqueuing a visible
+              // chunk: thinking-block tokens are dropped and tool-mode tokens
+              // are buffered into `accumulated` and only flushed at `done`, so
+              // a "daemon emitted a token" signal does NOT mean the wire saw
+              // bytes — heartbeat must keep firing until the first real
+              // outgoing chunk.
+              let visibleChunkSent = false;
+              const heartbeat = setInterval(() => {
+                if (visibleChunkSent || streamCancelled) return;
+                try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
+              }, 10_000);
               try {
                 let inThink = false;
                 let stripNextLeadingNl = false;
@@ -1313,7 +1399,31 @@ async function serve(port: number) {
                         text = text.split("</think>").slice(1).join("</think>");
                         inThink = false;
                         stripNextLeadingNl = true;
-                      } else { continue; }
+                      } else {
+                        // Stream thinking-phase tokens as `reasoning_content`
+                        // (OpenAI-compatible field, also adopted by DeepSeek and
+                        // pi-coding-agent). Two reasons to do this even though
+                        // the visible-content stripper still removes
+                        // `<think>...</think>` from the assistant message:
+                        //   1) the wire stays alive — without this, a
+                        //      thinking-heavy turn (Qwen3.5/3.6 routinely 2–8K
+                        //      thinking tokens before answering) leaves the
+                        //      content stream silent for minutes, recreating
+                        //      the same idle-timeout failure mode the prefill
+                        //      heartbeat was added to fix (#79 / #85);
+                        //   2) clients that render reasoning UI (pi, OpenCode
+                        //      with reasoning visible) get a live thinking
+                        //      view rather than nothing.
+                        // Patch contributed by @mikiadev in #79.
+                        if (text) {
+                          ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                            id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                            choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }]
+                          })}\n\n`));
+                          visibleChunkSent = true;
+                        }
+                        continue;
+                      }
                     }
                     text = text.replace(/<\|im_end\|>/g, "");
                     if (!text) continue;
@@ -1325,8 +1435,11 @@ async function serve(port: number) {
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
                       })}\n\n`));
+                      visibleChunkSent = true;
                     }
                   } else if (msg.type === "done") {
+                    // Every path below enqueues at least the [DONE] sentinel.
+                    visibleChunkSent = true;
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
@@ -1370,6 +1483,7 @@ async function serve(port: number) {
                     ctrl.close();
                     return;
                   } else if (msg.type === "error") {
+                    visibleChunkSent = true;
                     // Propagate daemon-side errors (e.g. KV-budget rejection on a
                     // giant prompt) to the client instead of masking them as a
                     // normal zero-token "stop" — otherwise clients can't tell a
@@ -1386,6 +1500,7 @@ async function serve(port: number) {
                 // Safety: if loop exits without done/error (shouldn't happen), close stream
                 try { ctrl.close(); } catch {}
               } finally {
+                clearInterval(heartbeat);
                 e.generating = false;
                 safeRelease();
               }
@@ -1421,9 +1536,17 @@ async function serve(port: number) {
         // Strip think tags and special tokens.
         // Greedy match: strip everything from first <think> to last </think>.
         // If <think> is unclosed, strip from <think> to end of content.
-        content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-          .replace(/<think>[\s\S]*$/, "") // unclosed think block
-          .replace(/<\|im_end\|>/g, "").trim();
+        // chat_template_kwargs.preserve_thinking=true keeps <think>...</think>
+        // intact in message.content for clients that want a single-string
+        // representation including reasoning. <|im_end|> stripping always
+        // applies (it would break clients that re-encode message history).
+        if (preserveThinking) {
+          content = content.replace(/<\|im_end\|>/g, "").trim();
+        } else {
+          content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+            .replace(/<think>[\s\S]*$/, "") // unclosed think block
+            .replace(/<\|im_end\|>/g, "").trim();
+        }
 
         // Check for tool calls in response
         const parsed = parseToolCalls(content);
