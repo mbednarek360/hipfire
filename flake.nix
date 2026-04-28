@@ -33,7 +33,7 @@
        # Absolute path to the CLI directory (known at build time).
         hipfireCliDir = "${hipfire-bin}/share/hipfire-cli";
 
-        # The hipfire CLI wrapper script with hardcoded CLI dir path.
+        # The hipfire CLI wrapper script with hardcoded bun and CLI dir paths.
         hipfireCliWrapper = pkgs.writeTextFile {
           name = "hipfire";
           executable = true;
@@ -42,17 +42,16 @@
             #!/bin/bash
             set +u
             set -e
-            if command -v bun >/dev/null 2>&1; then
-              BUN=bun
-            elif [ -x "$BUN_BIN" ]; then
-              BUN="$BUN_BIN"
-            elif [ -x "${pkgs.bun}/bin/bun" ]; then
-              BUN="${pkgs.bun}/bin/bun"
-            else
-              echo "hipfire: 'bun' not found. Install it or use the full hipfire package." >&2
+            BUN="${pkgs.bun}/bin/bun"
+            if [ ! -x "$BUN" ]; then
+              echo "hipfire: bun not found at $BUN" >&2
               exit 127
             fi
             CLI_DIR="${hipfireCliDir}"
+            if [ ! -f "$CLI_DIR/index.ts" ]; then
+              echo "hipfire: CLI not found at $CLI_DIR" >&2
+              exit 127
+            fi
             exec "$BUN" run "$CLI_DIR/index.ts" "$@"
           '';
         };
@@ -63,7 +62,8 @@
         hipfireKernels = pkgs.writeShellApplication {
           name = "hipfire-kernels";
           runtimeInputs = [ pkgs.gnugrep ];
-          text = ''
+         text = ''
+            set +u
             set -e
             export HIPFIRE_DIR="$HOME/.hipfire"
             export HIPFIRE_BIN="${placeholder "out"}/bin"
@@ -195,21 +195,6 @@
 
               # Install the kernel helper.
               cp ${hipfireKernels}/bin/hipfire-kernels $out/bin/hipfire-kernels
-
-              # ─── Environment setup hook ───────────────────────────────
-              mkdir -p $out/nix-support
-              cat >> $out/nix-support/setup-hook << 'HOOK'
-              export HIPFIRE_BIN="$out/bin"
-              export HIPFIRE_CLI_DIR="$out/share/hipfire-cli"
-              export BUN_BIN="${pkgs.bun}/bin/bun"
-
-              # Ensure the daemon can find ROCm at runtime (for JIT kernel compilation).
-              export HIP_PATH="${clr}"
-              export HIP_PLATFORM=amd
-              export ROCM_PATH="${clr}"
-              export HSA_PATH="${clr}"
-              export LD_LIBRARY_PATH="${rocm.rocm-runtime}/lib:${rocm.rocm-core}/lib:$LD_LIBRARY_PATH"
-            HOOK
           '';
 
           meta = with pkgs.lib; {
@@ -226,7 +211,7 @@
           name = "hipfire";
           src = hipfire-bin;
 
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeBuildInputs = [ pkgs.makeWrapper pkgs.bun ];
 
 installPhase = ''
             mkdir -p $out/bin $out/share
@@ -318,4 +303,4 @@ installPhase = ''
         devShells.default = devShell;
       }
     );
-}      
+}    
