@@ -159,11 +159,11 @@
               # Bundle the CLI TypeScript app.
               mkdir -p $out/share/hipfire/cli
               cp -r cli/* $out/share/hipfire/cli/
-              # Patch daemon lookup paths (lines 715, 3567) to use process.env.HIPFIRE_DIR
-              # for binary discovery, so Nix can set it to the store path while data dirs
-              # stay at ~/.hipfire.
-              sed -i '715s#HIPFIRE_DIR#process.env.HIPFIRE_DIR || join(homedir(), ".hipfire")#' $out/share/hipfire/cli/index.ts
-              sed -i '3567s#HIPFIRE_DIR#process.env.HIPFIRE_DIR || join(homedir(), ".hipfire")#' $out/share/hipfire/cli/index.ts
+              # Patch daemon lookup paths to use process.env.HIPFIRE_DIR for binary
+               # discovery, so Nix can set it to the store path while data dirs
+               # stay at ~/.hipfire. Matches only "join(HIPFIRE_DIR, "bin", `daemon"
+               # to avoid touching model/config/quantize paths.
+               sed -i 's#join(HIPFIRE_DIR, "bin", `daemon#join(process.env.HIPFIRE_DIR || join(homedir(), ".hipfire"), "bin", `daemon#g' $out/share/hipfire/cli/index.ts
 
               # Kernel pre-compilation helper.
               cp ${hipfireKernels}/bin/hipfire-kernels $out/share/hipfire/bin/
@@ -280,4 +280,4 @@
         devShells.default = devShell;
       }
     );
-} 
+}  
