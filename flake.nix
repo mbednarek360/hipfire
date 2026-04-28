@@ -30,11 +30,16 @@
         # Using pkgs.writeShellScriptBin with ''...'' (raw strings)
         # avoids all ${} escaping issues — bash variables stay literal.
 
-        # The `hipfire` CLI wrapper — locates bun and runs the TS CLI.
-        hipfireWrapper = pkgs.writeShellApplication {
+       # Absolute path to the CLI directory (known at build time).
+        hipfireCliDir = "${hipfire-bin}/share/hipfire-cli";
+
+        # The hipfire CLI wrapper script with hardcoded CLI dir path.
+        hipfireCliWrapper = pkgs.writeTextFile {
           name = "hipfire";
-          runtimeInputs = [ pkgs.bun ];
+          executable = true;
+          destination = "/bin/hipfire";
           text = ''
+            #!/bin/bash
             set +u
             set -e
             if command -v bun >/dev/null 2>&1; then
@@ -47,8 +52,7 @@
               echo "hipfire: 'bun' not found. Install it or use the full hipfire package." >&2
               exit 127
             fi
-            # Resolve CLI dir relative to the binary location.
-            CLI_DIR="$(dirname "$0")/../share/hipfire-cli"
+            CLI_DIR="${hipfireCliDir}"
             exec "$BUN" run "$CLI_DIR/index.ts" "$@"
           '';
         };
@@ -189,8 +193,7 @@
               mkdir -p $out/share/hipfire-cli
               cp -r cli/* $out/share/hipfire-cli/
 
-              # Install the hipfire wrapper and kernel helper.
-              cp ${hipfireWrapper}/bin/hipfire $out/bin/hipfire
+              # Install the kernel helper.
               cp ${hipfireKernels}/bin/hipfire-kernels $out/bin/hipfire-kernels
 
               # ─── Environment setup hook ───────────────────────────────
@@ -225,10 +228,13 @@
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
-          installPhase = ''
+installPhase = ''
             mkdir -p $out/bin $out/share
             cp -r ${hipfire-bin}/bin/* $out/bin/
             cp -r ${hipfire-bin}/share/* $out/share/
+
+            # Install the hipfire CLI wrapper with hardcoded CLI dir path.
+            cp ${hipfireCliWrapper}/bin/hipfire $out/bin/hipfire
 
             # Wrap every binary to ensure ROCm libs are discoverable.
             for bin in $out/bin/*; do
@@ -312,4 +318,4 @@
         devShells.default = devShell;
       }
     );
-}           
+}      
