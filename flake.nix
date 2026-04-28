@@ -46,7 +46,14 @@
               echo "hipfire: 'bun' not found. Install it or use the full hipfire package." >&2
               exit 127
             fi
-            exec "$BUN" run "$HIPFIRE_CLI_DIR/index.ts" "$@"
+            # Resolve CLI dir: use env var if set (nix profile activation),
+            # otherwise fall back to the standard share path relative to $out.
+            if [ -n "$HIPFIRE_CLI_DIR" ]; then
+              CLI_DIR="$HIPFIRE_CLI_DIR"
+            else
+              CLI_DIR="$(dirname "$0")/../share/hipfire-cli"
+            fi
+            exec "$BUN" run "$CLI_DIR/index.ts" "$@"
           '';
         };
 
