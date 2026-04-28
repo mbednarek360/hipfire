@@ -35,6 +35,7 @@
           name = "hipfire";
           runtimeInputs = [ pkgs.bun ];
           text = ''
+            set +u
             set -e
             if command -v bun >/dev/null 2>&1; then
               BUN=bun
@@ -46,13 +47,8 @@
               echo "hipfire: 'bun' not found. Install it or use the full hipfire package." >&2
               exit 127
             fi
-            # Resolve CLI dir: use env var if set (nix profile activation),
-            # otherwise fall back to the standard share path relative to $out.
-            if [ -n "$HIPFIRE_CLI_DIR" ]; then
-              CLI_DIR="$HIPFIRE_CLI_DIR"
-            else
-              CLI_DIR="$(dirname "$0")/../share/hipfire-cli"
-            fi
+            # Resolve CLI dir relative to the binary location.
+            CLI_DIR="$(dirname "$0")/../share/hipfire-cli"
             exec "$BUN" run "$CLI_DIR/index.ts" "$@"
           '';
         };
