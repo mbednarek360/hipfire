@@ -182,7 +182,9 @@
                   --set HIP_PATH "${clr}" \
                   --set HIP_PLATFORM amd \
                   --set ROCM_PATH "${clr}" \
-                  --set HSA_PATH "${clr}"
+                  --set HSA_PATH "${clr}" \
+                  --set DEVICE_LIB_PATH "${rocm.rocm-device-libs}/amdgcn/bitcode" \
+                  --set HIPFIRE_HIPCC_EXTRA_FLAGS "--rocm-path=${clr} --rocm-device-lib-path=${rocm.rocm-device-libs}/amdgcn/bitcode"
                 patchelf --set-rpath "${clr}/lib:$out/share/hipfire/bin" "$bin" 2>/dev/null || true
               done
 
@@ -278,4 +280,4 @@
         devShells.default = devShell;
       }
     );
-}  
+} 
