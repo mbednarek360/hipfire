@@ -218,28 +218,33 @@
           };
         };
 
-        # Wrapper that ensures ROCm runtime libs are on LD_LIBRARY_PATH
-        # so the daemon can dlopen libamdhip64.so at runtime.
-        hipfire = pkgs.symlinkJoin {
+        # Self-contained package with ROCm-wrapped binaries + CLI bundled.
+        hipfire = pkgs.stdenvNoCC.mkDerivation {
           name = "hipfire";
-          paths = [ hipfire-bin ];
-          buildInputs = [ pkgs.makeWrapper ];
-          postBuild = ''
-             # Wrap every binary in $out/bin to ensure ROCm libs are discoverable.
-             for bin in $out/bin/*; do
-               [ -f "$bin" ] || continue
-               [ -x "$bin" ] || continue
-               # Skip directories (kernels/compiled) and scripts that already have shebangs.
-               case "$(file -b "$bin")" in
-                 *script*text*) continue ;;
-               esac
-               wrapProgram "$bin" \
-                --prefix LD_LIBRARY_PATH : "${rocm.rocm-runtime}/lib:${rocm.rocm-core}/lib" \
-                --prefix PATH : "${rocm.rocm-core}/bin" \
-                --set HIP_PATH "${clr}" \
-                --set HIP_PLATFORM amd \
-                --set ROCM_PATH "${clr}" \
-                --set HSA_PATH "${clr}"
+          src = hipfire-bin;
+
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+
+          installPhase = ''
+            mkdir -p $out/bin $out/share
+            cp -r ${hipfire-bin}/bin/* $out/bin/
+            cp -r ${hipfire-bin}/share/* $out/share/
+
+            # Wrap every binary to ensure ROCm libs are discoverable.
+            for bin in $out/bin/*; do
+              [ -f "$bin" ] || continue
+              [ -x "$bin" ] || continue
+              # Skip directories (kernels/compiled) and scripts that already have shebangs.
+              case "$(file -b "$bin")" in
+                *script*text*) continue ;;
+              esac
+              wrapProgram "$bin" \
+               --prefix LD_LIBRARY_PATH : "${rocm.rocm-runtime}/lib:${rocm.rocm-core}/lib" \
+               --prefix PATH : "${rocm.rocm-core}/bin" \
+               --set HIP_PATH "${clr}" \
+               --set HIP_PLATFORM amd \
+               --set ROCM_PATH "${clr}" \
+               --set HSA_PATH "${clr}"
             done
           '';
         };
@@ -307,4 +312,4 @@
         devShells.default = devShell;
       }
     );
-}
+}           
