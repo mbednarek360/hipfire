@@ -531,6 +531,14 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
         }
+        17 => { // MQ3-G256
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0 })
+        }
+        18 => { // MQ2-G256
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
@@ -587,6 +595,14 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         15 => { // MQ6-G256 — MagnumQuant FWHT-rotated 6-bit
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
+        }
+        17 => { // MQ3-G256 — MagnumQuant FWHT-rotated 3-bit
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0 })
+        }
+        18 => { // MQ2-G256 — MagnumQuant FWHT-rotated 2-bit
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
         }
         3 => { // Q8_0
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -817,6 +833,78 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     out.push(scale * q6 + zero);
                     out.push(scale * q7 + zero);
                 }
+            }
+            out
+        }
+        17 | 18 => {
+            // MQ3-G256 (qt 17, 104 B/group, 3-bit) or MQ2-G256 (qt 18, 72 B/group, 2-bit).
+            // Both store FWHT-rotated weights — dequant then inverse-rotate to recover
+            // original values for CPU consumers (e.g., DeltaNet conv1d).
+            let is_mq3 = info.quant_type == 17;
+            let group_size: usize = 256;
+            let bytes_per_group: usize = if is_mq3 { 104 } else { 72 };
+            let n_groups = data.len() / bytes_per_group;
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            let signs1 = crate::llama::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = crate::llama::KvCache::gen_fwht_signs(1042, 256);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                let start = out.len();
+                if is_mq3 {
+                    // 8 values per 3 bytes (matches gemv_hfq3g256.hip unpack).
+                    for chunk in 0..32 {
+                        let bo = off + 8 + chunk * 3;
+                        let b0 = data[bo] as u32;
+                        let b1 = data[bo + 1] as u32;
+                        let b2 = data[bo + 2] as u32;
+                        let q0 = (b0 & 7) as f32;
+                        let q1 = ((b0 >> 3) & 7) as f32;
+                        let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
+                        let q3 = ((b1 >> 1) & 7) as f32;
+                        let q4 = ((b1 >> 4) & 7) as f32;
+                        let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
+                        let q6 = ((b2 >> 2) & 7) as f32;
+                        let q7 = ((b2 >> 5) & 7) as f32;
+                        out.push(scale * q0 + zero);
+                        out.push(scale * q1 + zero);
+                        out.push(scale * q2 + zero);
+                        out.push(scale * q3 + zero);
+                        out.push(scale * q4 + zero);
+                        out.push(scale * q5 + zero);
+                        out.push(scale * q6 + zero);
+                        out.push(scale * q7 + zero);
+                    }
+                } else {
+                    // MQ2: 4 values per byte (matches gemv_hfq2g256.hip unpack).
+                    for i in 0..64 {
+                        let byte_val = data[off + 8 + i] as u32;
+                        out.push(scale * ((byte_val & 3) as f32) + zero);
+                        out.push(scale * (((byte_val >> 2) & 3) as f32) + zero);
+                        out.push(scale * (((byte_val >> 4) & 3) as f32) + zero);
+                        out.push(scale * (((byte_val >> 6) & 3) as f32) + zero);
+                    }
+                }
+                // Inverse FWHT: recover original (pre-rotation) weight values.
+                let group = &mut out[start..start + 256];
+                for i in 0..256 { group[i] *= signs2[i]; }
+                let mut stride = 1;
+                while stride < 256 {
+                    let mut j = 0;
+                    while j < 256 {
+                        for k in 0..stride {
+                            let a = group[j + k];
+                            let b = group[j + k + stride];
+                            group[j + k] = a + b;
+                            group[j + k + stride] = a - b;
+                        }
+                        j += stride * 2;
+                    }
+                    stride <<= 1;
+                }
+                let scale_inv = 0.0625; // 1/sqrt(256)
+                for i in 0..256 { group[i] *= scale_inv * signs1[i]; }
             }
             out
         }
@@ -1206,6 +1294,22 @@ fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
         && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+}
+
+/// Detect any MQ3G256 weight inside a MoE FFN block (router, shared expert
+/// gate/up/down, shared_expert_gate router-mix scalar, or any routed
+/// expert's gate_up/down). The MoE batched FFN kernels assume HFQ4-layout
+/// (136 B/group); an MQ3 weight (104 B/group) would dispatch with the wrong
+/// stride. Used by the captured-prefill defense-in-depth check.
+fn moe_ffn_has_mq3(ffn: &MoeFfnWeights) -> bool {
+    ffn.router.gpu_dtype == DType::MQ3G256
+        || ffn.shared_expert_gate.gpu_dtype == DType::MQ3G256
+        || ffn.shared_expert.gate.gpu_dtype == DType::MQ3G256
+        || ffn.shared_expert.up.gpu_dtype == DType::MQ3G256
+        || ffn.shared_expert.down.gpu_dtype == DType::MQ3G256
+        || ffn.experts.iter().any(|e|
+            e.gate_up.gpu_dtype == DType::MQ3G256
+            || e.down.gpu_dtype == DType::MQ3G256)
 }
 
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
@@ -2623,6 +2727,90 @@ pub fn forward_prefill_batch_single_chunk_captured(
     let n = tokens.len();
     debug_assert!(n > 0 && n <= pbs.max_batch,
         "single_chunk_captured: n={} but pbs.max_batch={}", n, pbs.max_batch);
+
+    // Defense-in-depth: this entry point bypasses the eligibility check
+    // in `forward_prefill_batch_with_pbs`, so the caller is responsible
+    // for ensuring the batched fast-path is valid. Two structural bypasses
+    // could land here:
+    //   1. MQ3-weighted model on an arch that lacks the gfx11 wave32 WMMA
+    //      builtin (gfx12, gfx10, gfx906, gfx94x).
+    //   2. MQ3 weights inside a MoE/A3B layer (DeltaNetMoe/FullAttnMoe) —
+    //      the MoE batched branches dispatch through HFQ4-layout kernels
+    //      and would memory-fault on the 104-vs-136 byte stride.
+    // In production, `daemon.rs`'s DFlash refusal guard blocks both, but
+    // dflash_spec_demo and other example callers go through ModelSlot::load
+    // directly. We cross-check here so any caller is protected.
+    let arch = gpu.arch.as_str();
+    let mut mq3_in_dense = false;
+    let mut mq3_in_moe = false;
+    for lw in &weights.layers {
+        match lw {
+            LayerWeights::DeltaNet(l) => {
+                if matches!(l.wqkv.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wz.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_beta.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_alpha.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wo.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_gate.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_up.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_down.gpu_dtype, DType::MQ3G256)
+                { mq3_in_dense = true; }
+            }
+            LayerWeights::FullAttn(l) => {
+                if matches!(l.wq.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wk.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wv.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wo.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_gate.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_up.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_down.gpu_dtype, DType::MQ3G256)
+                { mq3_in_dense = true; }
+            }
+            LayerWeights::DeltaNetMoe(l) => {
+                if matches!(l.wqkv.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wz.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_beta.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.w_alpha.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wo.gpu_dtype, DType::MQ3G256)
+                    || moe_ffn_has_mq3(&l.ffn)
+                { mq3_in_moe = true; }
+            }
+            LayerWeights::FullAttnMoe(l) => {
+                if matches!(l.wq.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wk.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wv.gpu_dtype, DType::MQ3G256)
+                    || matches!(l.wo.gpu_dtype, DType::MQ3G256)
+                    || moe_ffn_has_mq3(&l.ffn)
+                { mq3_in_moe = true; }
+            }
+        }
+    }
+    let arch_has_wmma = matches!(arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        | "gfx1200" | "gfx1201"
+    );
+    if mq3_in_moe {
+        return Err(hip_bridge::HipError::new(0,
+            "forward_prefill_batch_single_chunk_captured: model has MQ3G256 \
+             weights inside a MoE/A3B layer (DeltaNetMoe or FullAttnMoe). The \
+             MoE batched prefill branches dispatch through HFQ4-layout kernels \
+             and would memory-fault on the 104-vs-136 byte stride. Use an MQ4 \
+             quantization for MoE/A3B targets, or wait for the MQ3 MoE \
+             branches to land."
+        ));
+    }
+    if mq3_in_dense && !arch_has_wmma {
+        return Err(hip_bridge::HipError::new(0, &format!(
+            "forward_prefill_batch_single_chunk_captured: model contains MQ3G256 \
+             weights but arch {arch} lacks the gfx11 wave32 WMMA builtin. The MQ3 \
+             prefill kernels (gemm_*_hfq3g256_wmma) only compile on \
+             gfx1100/1101/1102/1150/1151. Caller must use the non-captured \
+             forward_prefill_batch path (which falls back to per-token \
+             forward_scratch on this arch). gfx12 K4 variant for MQ3 is \
+             a planned follow-up."
+        )));
+    }
+
     forward_prefill_chunk(
         gpu, weights, config, tokens, start_pos,
         kv_cache, dn_state, scratch, pbs, hidden_rb,
@@ -2733,6 +2921,7 @@ pub fn forward_prefill_batch_with_pbs(
     // either constraint is violated, reject all MoE layers so the whole
     // chunk falls through to per-token.
     let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
+    let arch = gpu.arch.as_str();
     let eligible = !force_fallback
         && n >= MIN_BATCH
         && dn_state.quant == StateQuant::Q8
@@ -2742,14 +2931,14 @@ pub fn forward_prefill_batch_with_pbs(
         ))
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::DeltaNet(l) =>
-                is_batchable_la(l.wqkv.gpu_dtype)
-                    && is_batchable_la(l.wz.gpu_dtype)
-                    && is_batchable_la(l.w_beta.gpu_dtype)
-                    && is_batchable_la(l.w_alpha.gpu_dtype)
-                    && is_batchable_la(l.wo.gpu_dtype)
-                    && is_batchable_la(l.w_gate.gpu_dtype)
-                    && is_batchable_la(l.w_up.gpu_dtype)
-                    && is_batchable_la(l.w_down.gpu_dtype),
+                is_batchable_la(l.wqkv.gpu_dtype, arch)
+                    && is_batchable_la(l.wz.gpu_dtype, arch)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && is_batchable_la(l.w_gate.gpu_dtype, arch)
+                    && is_batchable_la(l.w_up.gpu_dtype, arch)
+                    && is_batchable_la(l.w_down.gpu_dtype, arch),
             LayerWeights::FullAttn(_) => true, // FA layer will take the gather/scatter path
             // MoE batched path: LA/FA projections must be MQ4 + every
             // routed/shared MoE weight must be MQ4. Top-K=8 and the
@@ -2757,19 +2946,19 @@ pub fn forward_prefill_batch_with_pbs(
             LayerWeights::DeltaNetMoe(l) =>
                 moe_topk_ok
                     && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && is_batchable_la(l.wqkv.gpu_dtype)
-                    && is_batchable_la(l.wz.gpu_dtype)
-                    && is_batchable_la(l.w_beta.gpu_dtype)
-                    && is_batchable_la(l.w_alpha.gpu_dtype)
-                    && is_batchable_la(l.wo.gpu_dtype)
+                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
+                    && is_batchable_la(l.wz.gpu_dtype, arch)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
                     && moe_ffn_all_mq4(&l.ffn),
             LayerWeights::FullAttnMoe(l) =>
                 moe_topk_ok
                     && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && is_batchable_la(l.wq.gpu_dtype)
-                    && is_batchable_la(l.wk.gpu_dtype)
-                    && is_batchable_la(l.wv.gpu_dtype)
-                    && is_batchable_la(l.wo.gpu_dtype)
+                    && is_batchable_la(l.wq.gpu_dtype, arch)
+                    && is_batchable_la(l.wk.gpu_dtype, arch)
+                    && is_batchable_la(l.wv.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
                     && moe_ffn_all_mq4(&l.ffn),
         });
 
@@ -2882,8 +3071,29 @@ pub fn forward_prefill_batch_with_pbs(
 /// eligibility check in `forward_prefill_batch` and the per-layer dtype
 /// branches in `forward_prefill_chunk`).
 #[inline]
-fn is_batchable_la(dt: DType) -> bool {
-    matches!(dt, DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256)
+fn is_batchable_la(dt: DType, arch: &str) -> bool {
+    let always_ok = matches!(dt,
+        DType::MQ4G256 | DType::HFQ4G256
+        | DType::MQ6G256 | DType::HFQ6G256
+    );
+    if always_ok {
+        return true;
+    }
+    // MQ3 is batchable on archs with a WMMA family ported. As of this
+    // commit:
+    //   - gfx11 (gfx1100/1101/1102/1150/1151): wave32 WMMA via the
+    //     `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` builtin.
+    //   - gfx12 (gfx1200/1201): wave32 WMMA via the `_w32_gfx12` builtin
+    //     with K4 unroll + half8_t lane-split.
+    // gfx10 RDNA1+2 / gfx906 GCN5 / gfx94x CDNA3 lack a ported MQ3 WMMA
+    // kernel; they stay on the per-token forward_scratch fallback
+    // (correct, just slower).
+    let mq3_with_wmma = matches!(dt, DType::MQ3G256)
+        && matches!(arch,
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+            | "gfx1200" | "gfx1201"
+        );
+    mq3_with_wmma
 }
 
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
@@ -3149,23 +3359,24 @@ fn forward_prefill_chunk(
     // differ by dtype and we branch on that at each layer) and (b) a Q8_0
     // or givens KV cache. If the check fails, FA layers fall back to
     // per-token gather/scatter via run_fa_layer_body.
+    let fa_arch = gpu.arch.as_str();
     let fa_batched_ok = (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) =>
-                is_batchable_la(l.wq.gpu_dtype) &&
-                is_batchable_la(l.wk.gpu_dtype) &&
-                is_batchable_la(l.wv.gpu_dtype) &&
-                is_batchable_la(l.wo.gpu_dtype) &&
-                is_batchable_la(l.w_gate.gpu_dtype) &&
-                is_batchable_la(l.w_up.gpu_dtype) &&
-                is_batchable_la(l.w_down.gpu_dtype),
+                is_batchable_la(l.wq.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wk.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wv.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wo.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.w_gate.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.w_up.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.w_down.gpu_dtype, fa_arch),
             // MoE variant: attention weights must be MQ4-class (FFN is
             // checked separately by moe_ffn_all_mq4 in the eligibility gate).
             LayerWeights::FullAttnMoe(l) =>
-                is_batchable_la(l.wq.gpu_dtype) &&
-                is_batchable_la(l.wk.gpu_dtype) &&
-                is_batchable_la(l.wv.gpu_dtype) &&
-                is_batchable_la(l.wo.gpu_dtype),
+                is_batchable_la(l.wq.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wk.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wv.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wo.gpu_dtype, fa_arch),
             _ => true, // LA layers don't gate this check
         });
     // Under hipGraph capture, scalar kernargs get BAKED into the kernarg blob
@@ -3197,8 +3408,9 @@ fn forward_prefill_chunk(
                 // plain rmsnormed activations. The GEMM kernels themselves
                 // are dtype-agnostic — they just consume whatever [N × K]
                 // activation buffer we point them at.
-                let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);
 
                 // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
                 // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
@@ -3218,6 +3430,16 @@ fn forward_prefill_chunk(
                 // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
                 if is_6bit {
                     gpu.gemm_qkvza_hfq6g256(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k, n,
+                    )?;
+                } else if is_mq3 {
+                    // X is already FWHT-rotated by fused_rmsnorm_rotate_mq_batched
+                    // above; call the bare HFQ3 WMMA (no second rotation).
+                    gpu.gemm_qkvza_hfq3g256_wmma(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
                         &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
@@ -3358,8 +3580,9 @@ fn forward_prefill_chunk(
                 // at quant time; math requires dot(rot(W), rot(x)) = dot(W,x)).
                 // For HFQ weights no rotation is needed — the activation
                 // feeds gemm_hfq{4,6}g256_residual directly.
-                let wo_is_mq = matches!(layer.wo.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let wo_is_mq = matches!(layer.wo.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
                 let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let wo_input = if wo_is_mq {
                     gpu.rotate_x_mq_batched(
                         &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
@@ -3373,6 +3596,11 @@ fn forward_prefill_chunk(
                         &layer.wo.buf, wo_input, &pbs.x_batch,
                         layer.wo.m, layer.wo.k, n,
                     )?;
+                } else if wo_is_mq3 {
+                    gpu.gemm_hfq3g256_residual_wmma(
+                        &layer.wo.buf, wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
                 } else {
                     gpu.gemm_hfq4g256_residual(
                         &layer.wo.buf, wo_input, &pbs.x_batch,
@@ -3381,8 +3609,9 @@ fn forward_prefill_chunk(
                 }
 
                 // FFN: rmsnorm (+ rotate for MQ).
-                let ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
                 let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
                 if ffn_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
                         &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
@@ -3397,6 +3626,14 @@ fn forward_prefill_chunk(
                 // Batched gate+up projection.
                 if ffn_is_6bit {
                     gpu.gemm_gate_up_hfq6g256(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch, &pbs.up_batch,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k, n,
+                    )?;
+                } else if ffn_is_mq3 {
+                    gpu.gemm_gate_up_hfq3g256_wmma(
                         &layer.w_gate.buf, &layer.w_up.buf,
                         &pbs.x_rot_batch,
                         &pbs.gate_ffn_batch, &pbs.up_batch,
@@ -3419,8 +3656,9 @@ fn forward_prefill_chunk(
                 // is purely element-wise and uses numel() as its length,
                 // so a [N × hidden_dim] tensor processes all rows in one
                 // launch with no batch offset needed.
-                let w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
                 let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
                 if w_down_is_mq {
                     gpu.fused_silu_mul_rotate_mq_batched(
                         &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
@@ -3435,6 +3673,11 @@ fn forward_prefill_chunk(
                 // Batched w_down + residual.
                 if w_down_is_6bit {
                     gpu.gemm_hfq6g256_residual(
+                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                        layer.w_down.m, layer.w_down.k, n,
+                    )?;
+                } else if w_down_is_mq3 {
+                    gpu.gemm_hfq3g256_residual_wmma(
                         &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
                         layer.w_down.m, layer.w_down.k, n,
                     )?;
@@ -3462,8 +3705,9 @@ fn forward_prefill_chunk(
                 // launch covers all N tokens at once.
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 let q_dim = config.n_heads * config.head_dim;
-                let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
 
                 // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
                 if qkv_is_mq {
@@ -3480,6 +3724,16 @@ fn forward_prefill_chunk(
                 // 2. Batched 3-way QKV projection (wq+wk+wv).
                 if qkv_is_6bit {
                     gpu.gemm_qkv_hfq6g256(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k, n,
+                    )?;
+                } else if qkv_is_mq3 {
+                    // X is already FWHT-rotated by fused_rmsnorm_rotate_mq_batched
+                    // above; call the bare HFQ3 WMMA (no second rotation).
+                    gpu.gemm_qkv_hfq3g256_wmma(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         &pbs.x_rot_batch,
                         &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
@@ -3525,15 +3779,24 @@ fn forward_prefill_chunk(
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
-                        let n_k = config.n_kv_heads * config.head_dim;
                         let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
-                        let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
-                        for b in 0..n {
-                            crate::triattn::record_prerope_qk(
-                                layer_idx,
-                                &q_cpu[b * n_q..(b + 1) * n_q],
-                                Some(&k_cpu[b * n_k..(b + 1) * n_k]),
-                            );
+                        if crate::triattn::tap_needs_k() {
+                            let n_k = config.n_kv_heads * config.head_dim;
+                            let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
+                            for b in 0..n {
+                                crate::triattn::record_prerope_qk(
+                                    layer_idx,
+                                    &q_cpu[b * n_q..(b + 1) * n_q],
+                                    Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                                );
+                            }
+                        } else {
+                            for b in 0..n {
+                                crate::triattn::record_prerope_q(
+                                    layer_idx,
+                                    &q_cpu[b * n_q..(b + 1) * n_q],
+                                );
+                            }
                         }
                     }
                 }
@@ -3700,8 +3963,9 @@ fn forward_prefill_chunk(
 
                 // 9. wo residual: x_batch += wo · (optional rotate)(fa_attn_out_batch).
                 // Same MQ rotation requirement as the LA wo path.
-                let fa_wo_is_mq = matches!(layer.wo.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let fa_wo_is_mq = matches!(layer.wo.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
                 let fa_wo_input = if fa_wo_is_mq {
                     gpu.rotate_x_mq_batched(
                         &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
@@ -3715,6 +3979,11 @@ fn forward_prefill_chunk(
                         &layer.wo.buf, fa_wo_input, &pbs.x_batch,
                         layer.wo.m, layer.wo.k, n,
                     )?;
+                } else if fa_wo_is_mq3 {
+                    gpu.gemm_hfq3g256_residual_wmma(
+                        &layer.wo.buf, fa_wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
                 } else {
                     gpu.gemm_hfq4g256_residual(
                         &layer.wo.buf, fa_wo_input, &pbs.x_batch,
@@ -3724,8 +3993,9 @@ fn forward_prefill_chunk(
 
                 // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
                 // (+ rotate for MQ), w_down residual.
-                let fa_ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let fa_ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
                 let fa_ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let fa_ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
                 if fa_ffn_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
                         &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
@@ -3744,6 +4014,14 @@ fn forward_prefill_chunk(
                         layer.w_gate.m, layer.w_up.m,
                         layer.w_gate.k, n,
                     )?;
+                } else if fa_ffn_is_mq3 {
+                    gpu.gemm_gate_up_hfq3g256_wmma(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch, &pbs.up_batch,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k, n,
+                    )?;
                 } else {
                     gpu.gemm_gate_up_hfq4g256(
                         &layer.w_gate.buf, &layer.w_up.buf,
@@ -3753,8 +4031,9 @@ fn forward_prefill_chunk(
                         layer.w_gate.k, n,
                     )?;
                 }
-                let fa_w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+                let fa_w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
                 let fa_w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let fa_w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
                 if fa_w_down_is_mq {
                     gpu.fused_silu_mul_rotate_mq_batched(
                         &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
@@ -3767,6 +4046,11 @@ fn forward_prefill_chunk(
                 }
                 if fa_w_down_is_6bit {
                     gpu.gemm_hfq6g256_residual(
+                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                        layer.w_down.m, layer.w_down.k, n,
+                    )?;
+                } else if fa_w_down_is_mq3 {
+                    gpu.gemm_hfq3g256_residual_wmma(
                         &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
                         layer.w_down.m, layer.w_down.k, n,
                     )?;
@@ -4022,15 +4306,24 @@ fn forward_prefill_chunk(
                     )?;
                     if !gpu_handled {
                         let n_q = config.n_heads * config.head_dim;
-                        let n_k = config.n_kv_heads * config.head_dim;
                         let q_cpu = gpu.download_f32(&pbs.fa_q_batch)?;
-                        let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
-                        for b in 0..n {
-                            crate::triattn::record_prerope_qk(
-                                layer_idx,
-                                &q_cpu[b * n_q..(b + 1) * n_q],
-                                Some(&k_cpu[b * n_k..(b + 1) * n_k]),
-                            );
+                        if crate::triattn::tap_needs_k() {
+                            let n_k = config.n_kv_heads * config.head_dim;
+                            let k_cpu = gpu.download_f32(&pbs.fa_k_batch)?;
+                            for b in 0..n {
+                                crate::triattn::record_prerope_qk(
+                                    layer_idx,
+                                    &q_cpu[b * n_q..(b + 1) * n_q],
+                                    Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                                );
+                            }
+                        } else {
+                            for b in 0..n {
+                                crate::triattn::record_prerope_q(
+                                    layer_idx,
+                                    &q_cpu[b * n_q..(b + 1) * n_q],
+                                );
+                            }
                         }
                     }
                 }
@@ -4266,11 +4559,26 @@ fn run_fa_layer_body(
     gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
     if crate::triattn::tap_enabled() {
-        let n_q = config.n_heads * config.head_dim;
-        let n_k = config.n_kv_heads * config.head_dim;
-        let q_cpu = gpu.download_f32(&s.fa_q)?;
-        let k_cpu = gpu.download_f32(&s.fa_k)?;
-        crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+        // Try GPU path first (matches the batched FA tap at line ~3499 in
+        // forward_prefill_batch). When the calibration tap is GPU-resident
+        // (CalibrateGpu) we MUST dispatch the kernel here — falling
+        // through to record_prerope_qk would either silently drop the
+        // sample (pre-Phase-2) or panic (post-Phase-2).
+        let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+            gpu, layer_idx, &s.fa_q.buf,
+            1, config.n_heads, config.head_dim,
+        )?;
+        if !gpu_handled {
+            let n_q = config.n_heads * config.head_dim;
+            let q_cpu = gpu.download_f32(&s.fa_q)?;
+            if crate::triattn::tap_needs_k() {
+                let n_k = config.n_kv_heads * config.head_dim;
+                let k_cpu = gpu.download_f32(&s.fa_k)?;
+                crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+            } else {
+                crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
+            }
+        }
     }
 
     // If TriAttention has compacted the cache, absolute RoPE phase diverges
@@ -4647,11 +4955,21 @@ fn forward_scratch_layers(
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
                 if crate::triattn::tap_enabled() {
-                    let n_q = config.n_heads * config.head_dim;
-                    let n_k = config.n_kv_heads * config.head_dim;
-                    let q_cpu = gpu.download_f32(&s.fa_q)?;
-                    let k_cpu = gpu.download_f32(&s.fa_k)?;
-                    crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                        gpu, layer_idx, &s.fa_q.buf,
+                        1, config.n_heads, config.head_dim,
+                    )?;
+                    if !gpu_handled {
+                        let n_q = config.n_heads * config.head_dim;
+                        let q_cpu = gpu.download_f32(&s.fa_q)?;
+                        if crate::triattn::tap_needs_k() {
+                            let n_k = config.n_kv_heads * config.head_dim;
+                            let k_cpu = gpu.download_f32(&s.fa_k)?;
+                            crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                        } else {
+                            crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
+                        }
+                    }
                 }
 
                 if kv_cache.compact_offset > 0 {
@@ -4928,11 +5246,21 @@ fn forward_scratch_layers(
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
                 if crate::triattn::tap_enabled() {
-                    let n_q = config.n_heads * config.head_dim;
-                    let n_k = config.n_kv_heads * config.head_dim;
-                    let q_cpu = gpu.download_f32(&s.fa_q)?;
-                    let k_cpu = gpu.download_f32(&s.fa_k)?;
-                    crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                        gpu, layer_idx, &s.fa_q.buf,
+                        1, config.n_heads, config.head_dim,
+                    )?;
+                    if !gpu_handled {
+                        let n_q = config.n_heads * config.head_dim;
+                        let q_cpu = gpu.download_f32(&s.fa_q)?;
+                        if crate::triattn::tap_needs_k() {
+                            let n_k = config.n_kv_heads * config.head_dim;
+                            let k_cpu = gpu.download_f32(&s.fa_k)?;
+                            crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                        } else {
+                            crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
+                        }
+                    }
                 }
 
                 if kv_cache.compact_offset > 0 {
